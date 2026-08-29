@@ -5,6 +5,7 @@ internal sealed class MainForm : Form
     private readonly List<SourceDocument> _sources = new();
     private readonly HashSet<string> _hiddenSongs = new(StringComparer.OrdinalIgnoreCase);
     private readonly JacketResolver _jacketResolver = new();
+    private readonly PreviewPlayer _previewPlayer = new();
     private readonly System.Windows.Forms.Timer _searchDebounce = new() { Interval = 120 };
     private List<DbSong> _merged = new();
     private bool _refreshingGrid;
@@ -78,7 +79,7 @@ internal sealed class MainForm : Form
     {
         Dock = DockStyle.Fill,
         TextAlign = ContentAlignment.MiddleCenter,
-        Text = "Choose a jacket folder to resolve by song ID",
+        Text = "Choose a jacket/preview folder to resolve media by song ID",
         BackColor = UiTheme.Panel,
         ForeColor = UiTheme.Muted,
         Font = new Font("Segoe UI", 8.5F),
@@ -126,6 +127,14 @@ internal sealed class MainForm : Form
         UiTheme.TryEnableDarkTitleBar(this);
     }
 
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _previewPlayer.Dispose();
+        _jacketResolver.Dispose();
+        _searchDebounce.Dispose();
+        base.OnFormClosed(e);
+    }
+
     private void BuildColumns()
     {
         _grid.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
@@ -153,19 +162,24 @@ internal sealed class MainForm : Form
             SelectionBackColor = UiTheme.Selection,
             SelectionForeColor = Color.White,
         };
-        _grid.RowTemplate.Height = 29;
+        _grid.RowTemplate.Height = 40;
         _grid.ColumnHeadersHeight = 32;
         _grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
 
-        _grid.Columns.Add(new DataGridViewTextBoxColumn
+        var jacketColumn = new DataGridViewImageColumn
         {
-            HeaderText = "J",
-            Width = 36,
-            MinimumWidth = 36,
+            HeaderText = "Jacket",
+            Width = 48,
+            MinimumWidth = 48,
             Name = "Jacket",
             AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
-            DefaultCellStyle = new DataGridViewCellStyle { Alignment = DataGridViewContentAlignment.MiddleCenter },
-        });
+            ImageLayout = DataGridViewImageCellLayout.Zoom,
+            SortMode = DataGridViewColumnSortMode.NotSortable,
+        };
+        jacketColumn.DefaultCellStyle.NullValue = null;
+        jacketColumn.DefaultCellStyle.Padding = new Padding(3);
+        _grid.Columns.Add(jacketColumn);
+
         AddFillColumn("Title", "Title", 18, 110);
         AddFillColumn("Artist", "Artist", 17, 110);
         AddFillColumn("Pack", "Pack", 11, 70);
@@ -202,7 +216,7 @@ internal sealed class MainForm : Form
             AutoScroll = true,
         };
         toolbar.Controls.Add(UiTheme.MakeButton("Open JSON/Songlist...", (_, _) => OpenFiles()));
-        toolbar.Controls.Add(UiTheme.MakeButton("Choose Jacket Folder...", (_, _) => ChooseJacketFolder()));
+        toolbar.Controls.Add(UiTheme.MakeButton("Choose Jacket/Preview Folder...", (_, _) => ChooseMediaFolder()));
         toolbar.Controls.Add(Separator());
         toolbar.Controls.Add(UiTheme.MakeButton("Rebuild / Merge All", (_, _) => RebuildMerged()));
         toolbar.Controls.Add(Separator());
@@ -305,10 +319,6 @@ internal sealed class MainForm : Form
         right.Controls.Add(gridArea, 0, 0);
         right.Controls.Add(detailsArea, 0, 1);
 
-        // Do not set large Panel1MinSize/Panel2MinSize values here. During form
-        // construction SplitContainer still has its tiny design-time size, and
-        // WinForms can throw before the window is ever shown if the requested
-        // minimums cannot fit. The Form.MinimumSize already protects usability.
         var root = new SplitContainer
         {
             Dock = DockStyle.Fill,
@@ -328,7 +338,7 @@ internal sealed class MainForm : Form
             Dock = DockStyle.Bottom,
             Height = 29,
             BackColor = UiTheme.Panel,
-            Padding = new Padding(0),
+            Padding = Padding.Empty,
         };
         statusBar.Controls.Add(_status);
 
@@ -362,12 +372,39 @@ internal sealed class MainForm : Form
         {
             if (!_refreshingGrid) ShowSelectedSong();
         };
-        _grid.CellDoubleClick += (_, _) => ShowSelectedSong();
+        _grid.CellDoubleClick += (_, e) =>
+        {
+            if (e.RowIndex < 0) return;
+            if (e.ColumnIndex >= 0)
+                _grid.CurrentCell = _grid.Rows[e.RowIndex].Cells[e.ColumnIndex];
+            TogglePreview();
+        };
+        _grid.CellFormatting += (_, e) =>
+        {
+            if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+            if (_grid.Columns[e.ColumnIndex].Name != "Jacket") return;
+            if (_grid.Rows[e.RowIndex].Tag is not DbSong song) return;
+            e.Value = _jacketResolver.GetThumbnail(song.Id, 34);
+            e.FormattingApplied = true;
+        };
         _grid.CellToolTipTextNeeded += (_, e) =>
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
+            if (_grid.Columns[e.ColumnIndex].Name == "Jacket"
+                && _grid.Rows[e.RowIndex].Tag is DbSong song)
+            {
+                var jacket = _jacketResolver.Resolve(song.Id);
+                var preview = _jacketResolver.ResolvePreview(song.Id);
+                e.ToolTipText = string.Join("\n", new[]
+                {
+                    jacket is null ? null : $"Jacket: {_jacketResolver.DisplayPath(jacket)}",
+                    preview is null ? null : $"Preview: {_jacketResolver.DisplayPath(preview)}",
+                }.Where(x => x is not null));
+                return;
+            }
             e.ToolTipText = Convert.ToString(_grid.Rows[e.RowIndex].Cells[e.ColumnIndex].Value) ?? string.Empty;
         };
+        _previewPlayer.PlaybackStopped += (_, _) => PreviewStoppedFromAnyThread();
     }
 
     private void OpenFiles()
@@ -401,11 +438,11 @@ internal sealed class MainForm : Form
         RebuildMerged();
     }
 
-    private void ChooseJacketFolder()
+    private void ChooseMediaFolder()
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Choose the master jacket folder. Supported layouts: <songid>.png/.jpg OR <songid>/base.png/.jpg OR dl_<songid>/base.png/.jpg",
+            Description = "Choose the master jacket/preview folder. Jackets: <songid>.png/.jpg or <songid>/base|1080_base. Previews: <songid>.<audio> or <songid>/preview|base.<audio>. dl_<songid> folders are also supported.",
             UseDescriptionForTitle = true,
             ShowNewFolderButton = false,
             SelectedPath = _jacketResolver.RootFolder ?? string.Empty,
@@ -415,14 +452,16 @@ internal sealed class MainForm : Form
         try
         {
             UseWaitCursor = true;
+            _previewPlayer.StopImmediately();
+            _grid.Rows.Clear();
             _jacketResolver.Configure(dialog.SelectedPath);
             RefreshGrid();
             ShowSelectedSong();
-            UpdateStatus($"Jackets: {_jacketResolver.Count} indexed from {_jacketResolver.RootFolder}");
+            UpdateStatus($"Media indexed from {_jacketResolver.RootFolder}");
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, "Could not index jacket folder", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(this, ex.Message, "Could not index jacket/preview folder", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
@@ -437,7 +476,8 @@ internal sealed class MainForm : Form
         _sourceList.Items.Clear();
         foreach (var source in _sources) _sourceList.Items.Add(source);
         _sourceList.EndUpdate();
-        if (_sourceList.Items.Count > 0) _sourceList.SelectedIndex = Math.Clamp(selected, 0, _sourceList.Items.Count - 1);
+        if (_sourceList.Items.Count > 0)
+            _sourceList.SelectedIndex = Math.Clamp(selected, 0, _sourceList.Items.Count - 1);
     }
 
     private void RebuildMerged()
@@ -450,7 +490,9 @@ internal sealed class MainForm : Form
     private void UpdateStatus(string? extra = null)
     {
         _status.Text = $"{_sources.Count} source file(s)   |   {_merged.Count} merged songs"
-            + (_jacketResolver.IsConfigured ? $"   |   {_jacketResolver.Count} jackets" : string.Empty)
+            + (_jacketResolver.IsConfigured
+                ? $"   |   {_jacketResolver.Count} jackets   |   {_jacketResolver.PreviewCount} previews"
+                : string.Empty)
             + (string.IsNullOrWhiteSpace(extra) ? string.Empty : $"   |   {extra}");
     }
 
@@ -466,12 +508,12 @@ internal sealed class MainForm : Form
         _grid.SuspendLayout();
         _grid.Rows.Clear();
         DataGridViewRow? rowToSelect = null;
+
         foreach (var song in visible)
         {
-            var jacketPath = _jacketResolver.Resolve(song.Id);
             var values = new List<object?>
             {
-                jacketPath is null ? "" : "●",
+                null,
                 song.Title,
                 song.Artist,
                 song.Pack,
@@ -484,9 +526,11 @@ internal sealed class MainForm : Form
             var rowIndex = _grid.Rows.Add(values.ToArray());
             var row = _grid.Rows[rowIndex];
             row.Tag = song;
-            if (selectedKey is not null && string.Equals(song.DisplayKey, selectedKey, StringComparison.OrdinalIgnoreCase))
+            if (selectedKey is not null
+                && string.Equals(song.DisplayKey, selectedKey, StringComparison.OrdinalIgnoreCase))
                 rowToSelect = row;
         }
+
         _grid.ResumeLayout();
         _refreshingGrid = false;
 
@@ -505,6 +549,7 @@ internal sealed class MainForm : Form
             ClearDetails();
             return;
         }
+
         ShowSelectedSong();
     }
 
@@ -518,6 +563,7 @@ internal sealed class MainForm : Form
             ClearDetails();
             return;
         }
+
         _details.Text = song.DetailText();
         LoadJacket(song);
     }
@@ -529,32 +575,91 @@ internal sealed class MainForm : Form
 
         if (!_jacketResolver.IsConfigured)
         {
-            _jacketState.Text = "Choose a jacket folder to resolve by song ID";
+            _jacketState.Text = "Choose a jacket/preview folder to resolve media by song ID";
             return;
         }
         if (string.IsNullOrWhiteSpace(song.Id))
         {
-            _jacketState.Text = "No song ID; cannot resolve jacket";
+            _jacketState.Text = "No song ID; cannot resolve local media";
             return;
         }
 
-        var path = _jacketResolver.Resolve(song.Id);
-        if (path is null)
+        var jacketPath = _jacketResolver.Resolve(song.Id);
+        var previewPath = _jacketResolver.ResolvePreview(song.Id);
+
+        if (jacketPath is not null)
         {
-            _jacketState.Text = $"No jacket found for {song.Id}";
+            try
+            {
+                using var stream = new FileStream(jacketPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var source = Image.FromStream(stream);
+                _jacket.Image = new Bitmap(source);
+            }
+            catch (Exception ex)
+            {
+                _jacketState.Text = $"Could not render {Path.GetFileName(jacketPath)}: {ex.Message}";
+                return;
+            }
+        }
+
+        var jacketText = jacketPath is null ? "No jacket" : $"Jacket: {_jacketResolver.DisplayPath(jacketPath)}";
+        var previewText = previewPath is null ? "No preview" : $"Preview: {_jacketResolver.DisplayPath(previewPath)}";
+        _jacketState.Text = $"{jacketText}   |   {previewText}";
+    }
+
+    private void TogglePreview()
+    {
+        if (_previewPlayer.IsActive)
+        {
+            _previewPlayer.FadeOutAndStop();
+            UpdateStatus("Fading out preview...");
+            return;
+        }
+
+        var song = SelectedSong();
+        if (song is null) return;
+        if (!_jacketResolver.IsConfigured)
+        {
+            UpdateStatus("Choose a jacket/preview folder first");
+            return;
+        }
+
+        var previewPath = _jacketResolver.ResolvePreview(song.Id);
+        if (previewPath is null)
+        {
+            UpdateStatus($"No preview found for {song.Title}");
             return;
         }
 
         try
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            using var source = Image.FromStream(stream);
-            _jacket.Image = new Bitmap(source);
-            _jacketState.Text = Path.GetRelativePath(_jacketResolver.RootFolder!, path);
+            _previewPlayer.Play(previewPath);
+            UpdateStatus($"Playing preview: {song.Title}   |   double-click to fade out");
         }
         catch (Exception ex)
         {
-            _jacketState.Text = $"Could not render {Path.GetFileName(path)}: {ex.Message}";
+            UpdateStatus($"Preview failed: {Path.GetFileName(previewPath)}");
+            MessageBox.Show(this,
+                $"Could not decode/play preview:\n{previewPath}\n\n{ex.Message}",
+                "Preview playback failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+    }
+
+    private void PreviewStoppedFromAnyThread()
+    {
+        if (IsDisposed || Disposing) return;
+        try
+        {
+            if (InvokeRequired)
+                BeginInvoke(new Action(() => UpdateStatus("Preview stopped")));
+            else
+                UpdateStatus("Preview stopped");
+        }
+        catch
+        {
+            // Window is closing; no status update is needed.
         }
     }
 
@@ -565,7 +670,7 @@ internal sealed class MainForm : Form
         _jacket.Image = null;
         _jacketState.Text = _jacketResolver.IsConfigured
             ? "Select a song"
-            : "Choose a jacket folder to resolve by song ID";
+            : "Choose a jacket/preview folder to resolve media by song ID";
     }
 
     private void DetachSource()
