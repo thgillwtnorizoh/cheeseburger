@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "tools/fetch_wikis.py"
+      - "tools/fetch_wikiwiki_pages.py"
       - "requirements-fetch.txt"
       - ".github/workflows/fetch-wikiwiki.yml"
   schedule:
@@ -42,7 +43,7 @@ jobs:
 
       - name: Fetch representative song pages
         run: |
-          python tools/fetch_wikis.py wikiwiki-pages \
+          python tools/fetch_wikiwiki_pages.py \
             --strict \
             --index build/wikiwiki-jp-songs.json \
             --title "Purgatorium" \
@@ -77,8 +78,6 @@ jobs:
           def chart(title, diff):
               return by_title[title]["charts"][diff]
 
-          # Long-stable values give us hard parser assertions rather than a
-          # weak 'the page returned 200' test.
           assert chart("Purgatorium", "PST")["notes"] == 609
           assert chart("Purgatorium", "PST")["constant"] == 2.5
           assert chart("Purgatorium", "PRS")["notes"] == 641
@@ -88,10 +87,22 @@ jobs:
           assert chart("Purgatorium", "BYD")["notes"] == 1051
           assert chart("Purgatorium", "BYD")["constant"] == 9.6
 
+          testify = by_title["Testify"]
+          assert chart("Testify", "PST")["notes"] == 1001
+          assert chart("Testify", "PRS")["notes"] == 1225
+          assert chart("Testify", "FTR")["notes"] == 1766
+          assert chart("Testify", "BYD")["notes"] == 2221
+          assert chart("Testify", "PST")["constant"] == 7.8
+          assert chart("Testify", "PRS")["constant"] == 9.4
+          assert chart("Testify", "FTR")["constant"] == 10.9
+          assert chart("Testify", "BYD")["constant"] == 12.0
+
           deinos = by_title["DEINOS PHAINEIN"]
           assert deinos["song"]["bpm"] == 190
           assert deinos["song"]["length"] == "2:48"
           assert deinos["song"]["added_version"] == "7.0.0"
+          assert chart("DEINOS PHAINEIN", "PST")["notes"] == 1008
+          assert chart("DEINOS PHAINEIN", "PRS")["notes"] == 1178
           assert chart("DEINOS PHAINEIN", "FTR")["level"] == "10+"
           assert chart("DEINOS PHAINEIN", "FTR")["notes"] == 1888
           assert chart("DEINOS PHAINEIN", "FTR")["constant"] == 10.9
@@ -100,13 +111,11 @@ jobs:
           assert chart("DEINOS PHAINEIN", "INS")["constant"] == 12.0
           assert set(deinos["_meta"]["missing_constants"]) == {"PST", "PRS"}
 
-          # Regression checks for awkward titles and a high-difficulty page.
           assert "#1f1e33" in by_title
           assert by_title["#1f1e33"]["charts"]
-          assert "Testify" in by_title
-          assert any(c.get("notes") for c in by_title["Testify"]["charts"].values())
 
           print("Purgatorium:", by_title["Purgatorium"]["charts"])
+          print("Testify:", testify["charts"])
           print("DEINOS:", deinos["charts"])
           print("DEINOS missing constants:", deinos["_meta"]["missing_constants"])
           print("all page assertions passed")
