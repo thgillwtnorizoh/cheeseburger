@@ -1,0 +1,52 @@
+name: Build DB Studio
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - db-studio-prototype
+    paths:
+      - "DbStudio/**"
+      - ".github/workflows/build-db-studio.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore DbStudio/Cheeseburger.DbStudio.csproj
+
+      - name: Build
+        run: dotnet build DbStudio/Cheeseburger.DbStudio.csproj -c Release --no-restore
+
+      - name: Publish Windows x64
+        run: >-
+          dotnet publish DbStudio/Cheeseburger.DbStudio.csproj
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -p:DebugType=None
+          -o build/db-studio-win-x64
+
+      - name: Upload prototype
+        uses: actions/upload-artifact@v4
+        with:
+          name: cheeseburger-db-studio-win-x64
+          path: build/db-studio-win-x64/**
+          if-no-files-found: error
+          retention-days: 14
