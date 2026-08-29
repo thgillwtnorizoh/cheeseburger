@@ -2,9 +2,14 @@ namespace Cheeseburger.DbStudio;
 
 internal sealed class JacketResolver
 {
-    private static readonly HashSet<string> Extensions = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly string[] Extensions =
     {
         ".png", ".jpg", ".jpeg"
+    };
+
+    private static readonly string[] FolderImageNames =
+    {
+        "base", "1080_base"
     };
 
     private readonly Dictionary<string, string> _bySongId = new(StringComparer.OrdinalIgnoreCase);
@@ -32,7 +37,7 @@ internal sealed class JacketResolver
         //   <master>/<songid>.jpg
         foreach (var file in Directory.EnumerateFiles(RootFolder, "*", SearchOption.TopDirectoryOnly))
         {
-            if (!Extensions.Contains(Path.GetExtension(file))) continue;
+            if (!Extensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase)) continue;
             var id = Path.GetFileNameWithoutExtension(file);
             if (string.IsNullOrWhiteSpace(id)) continue;
             _bySongId.TryAdd(id, file);
@@ -40,7 +45,12 @@ internal sealed class JacketResolver
 
         // Layout B:
         //   <master>/<songid>/base.png
+        //   <master>/<songid>/1080_base.jpg
         //   <master>/dl_<songid>/base.jpg
+        //   <master>/dl_<songid>/1080_base.png
+        //
+        // If both base.* and 1080_base.* exist, base.* keeps priority so
+        // existing jacket folders behave exactly as before.
         foreach (var directory in Directory.EnumerateDirectories(RootFolder, "*", SearchOption.TopDirectoryOnly))
         {
             var folderName = Path.GetFileName(directory);
@@ -51,14 +61,24 @@ internal sealed class JacketResolver
                 : folderName;
             if (string.IsNullOrWhiteSpace(id) || _bySongId.ContainsKey(id)) continue;
 
-            var baseImage = Directory.EnumerateFiles(directory, "*", SearchOption.TopDirectoryOnly)
-                .FirstOrDefault(file =>
-                    Extensions.Contains(Path.GetExtension(file))
-                    && string.Equals(Path.GetFileNameWithoutExtension(file), "base", StringComparison.OrdinalIgnoreCase));
-
-            if (baseImage is not null)
-                _bySongId[id] = baseImage;
+            var jacket = FindFolderJacket(directory);
+            if (jacket is not null)
+                _bySongId[id] = jacket;
         }
+    }
+
+    private static string? FindFolderJacket(string directory)
+    {
+        foreach (var name in FolderImageNames)
+        {
+            foreach (var extension in Extensions)
+            {
+                var candidate = Path.Combine(directory, name + extension);
+                if (File.Exists(candidate)) return candidate;
+            }
+        }
+
+        return null;
     }
 
     public string? Resolve(string? songId)
