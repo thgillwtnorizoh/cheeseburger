@@ -45,6 +45,17 @@ jobs:
           -p:DebugType=None
           -o build/db-studio-win-x64
 
+      - name: Runtime smoke test
+        shell: pwsh
+        run: |
+          & "./build/db-studio-win-x64/Cheeseburger.DbStudio.exe" --smoke-test
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path "./build/db-studio-win-x64/dbstudio-crash.log") {
+              Get-Content "./build/db-studio-win-x64/dbstudio-crash.log"
+            }
+            exit $LASTEXITCODE
+          }
+
       - name: Upload prototype
         uses: actions/upload-artifact@v4
         with:
