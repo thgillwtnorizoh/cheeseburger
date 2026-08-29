@@ -305,14 +305,16 @@ internal sealed class MainForm : Form
         right.Controls.Add(gridArea, 0, 0);
         right.Controls.Add(detailsArea, 0, 1);
 
+        // Do not set large Panel1MinSize/Panel2MinSize values here. During form
+        // construction SplitContainer still has its tiny design-time size, and
+        // WinForms can throw before the window is ever shown if the requested
+        // minimums cannot fit. The Form.MinimumSize already protects usability.
         var root = new SplitContainer
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Vertical,
             SplitterDistance = 220,
             SplitterWidth = 5,
-            Panel1MinSize = 170,
-            Panel2MinSize = 700,
             FixedPanel = FixedPanel.Panel1,
             BackColor = UiTheme.Border,
         };
@@ -435,8 +437,7 @@ internal sealed class MainForm : Form
         _sourceList.Items.Clear();
         foreach (var source in _sources) _sourceList.Items.Add(source);
         _sourceList.EndUpdate();
-        if (_sourceList.Items.Count > 0)
-            _sourceList.SelectedIndex = Math.Clamp(selected, 0, _sourceList.Items.Count - 1);
+        if (_sourceList.Items.Count > 0) _sourceList.SelectedIndex = Math.Clamp(selected, 0, _sourceList.Items.Count - 1);
     }
 
     private void RebuildMerged()
@@ -446,12 +447,11 @@ internal sealed class MainForm : Form
         UpdateStatus();
     }
 
-    private void UpdateStatus(string? message = null)
+    private void UpdateStatus(string? extra = null)
     {
-        var jacketText = string.IsNullOrWhiteSpace(_jacketResolver.RootFolder)
-            ? "jackets: none"
-            : $"jackets: {_jacketResolver.Count}";
-        _status.Text = message ?? $"{_sources.Count} source file(s)   |   {_merged.Count} merged songs   |   {jacketText}";
+        _status.Text = $"{_sources.Count} source file(s)   |   {_merged.Count} merged songs"
+            + (_jacketResolver.IsConfigured ? $"   |   {_jacketResolver.Count} jackets" : string.Empty)
+            + (string.IsNullOrWhiteSpace(extra) ? string.Empty : $"   |   {extra}");
     }
 
     private void RefreshGrid()
@@ -464,49 +464,48 @@ internal sealed class MainForm : Form
 
         _refreshingGrid = true;
         _grid.SuspendLayout();
-        try
+        _grid.Rows.Clear();
+        DataGridViewRow? rowToSelect = null;
+        foreach (var song in visible)
         {
-            _grid.Rows.Clear();
-            var selectedIndex = -1;
-            foreach (var song in visible)
+            var jacketPath = _jacketResolver.Resolve(song.Id);
+            var values = new List<object?>
             {
-                var jacketPath = ResolvedJacketPath(song);
-                var values = new List<object?>
-                {
-                    jacketPath is null ? "" : "●",
-                    song.Title,
-                    song.Artist,
-                    song.Pack,
-                    song.AddedVersion,
-                };
-                foreach (var diff in new[] { "PST", "PRS", "FTR", "ETR", "BYD", "INS" })
-                    values.Add(song.Charts.TryGetValue(diff, out var chart) ? chart.Compact() : "-");
-                values.Add(string.Join(", ", song.Sources.OrderBy(x => x)));
+                jacketPath is null ? "" : "●",
+                song.Title,
+                song.Artist,
+                song.Pack,
+                song.AddedVersion,
+            };
+            foreach (var diff in new[] { "PST", "PRS", "FTR", "ETR", "BYD", "INS" })
+                values.Add(song.Charts.TryGetValue(diff, out var chart) ? chart.Compact() : "-");
+            values.Add(string.Join(", ", song.Sources.OrderBy(x => x)));
 
-                var rowIndex = _grid.Rows.Add(values.ToArray());
-                _grid.Rows[rowIndex].Tag = song;
-                if (selectedKey is not null && song.DisplayKey == selectedKey) selectedIndex = rowIndex;
-            }
-
-            if (_grid.Rows.Count > 0)
-            {
-                selectedIndex = selectedIndex >= 0 ? selectedIndex : 0;
-                _grid.ClearSelection();
-                _grid.Rows[selectedIndex].Selected = true;
-                _grid.CurrentCell = _grid.Rows[selectedIndex].Cells["Title"];
-            }
-            else
-            {
-                ClearDetails();
-            }
+            var rowIndex = _grid.Rows.Add(values.ToArray());
+            var row = _grid.Rows[rowIndex];
+            row.Tag = song;
+            if (selectedKey is not null && string.Equals(song.DisplayKey, selectedKey, StringComparison.OrdinalIgnoreCase))
+                rowToSelect = row;
         }
-        finally
+        _grid.ResumeLayout();
+        _refreshingGrid = false;
+
+        if (rowToSelect is not null)
         {
-            _grid.ResumeLayout(true);
-            _refreshingGrid = false;
+            rowToSelect.Selected = true;
+            _grid.CurrentCell = rowToSelect.Cells[Math.Min(1, rowToSelect.Cells.Count - 1)];
         }
-
-        if (_grid.Rows.Count > 0) ShowSelectedSong();
+        else if (_grid.Rows.Count > 0)
+        {
+            _grid.Rows[0].Selected = true;
+            _grid.CurrentCell = _grid.Rows[0].Cells[Math.Min(1, _grid.Rows[0].Cells.Count - 1)];
+        }
+        else
+        {
+            ClearDetails();
+            return;
+        }
+        ShowSelectedSong();
     }
 
     private DbSong? SelectedSong() => _grid.CurrentRow?.Tag as DbSong;
@@ -523,45 +522,39 @@ internal sealed class MainForm : Form
         LoadJacket(song);
     }
 
-    private string? ResolvedJacketPath(DbSong song)
-    {
-        var resolved = _jacketResolver.Resolve(song.Id);
-        if (resolved is not null && File.Exists(resolved)) return resolved;
-        if (!string.IsNullOrWhiteSpace(song.Artwork) && File.Exists(song.Artwork)) return song.Artwork;
-        return null;
-    }
-
     private void LoadJacket(DbSong song)
     {
         _jacket.Image?.Dispose();
         _jacket.Image = null;
 
-        var path = ResolvedJacketPath(song);
+        if (!_jacketResolver.IsConfigured)
+        {
+            _jacketState.Text = "Choose a jacket folder to resolve by song ID";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(song.Id))
+        {
+            _jacketState.Text = "No song ID; cannot resolve jacket";
+            return;
+        }
+
+        var path = _jacketResolver.Resolve(song.Id);
         if (path is null)
         {
-            if (!string.IsNullOrWhiteSpace(_jacketResolver.RootFolder))
-            {
-                _jacketState.Text = string.IsNullOrWhiteSpace(song.Id)
-                    ? "No song ID; cannot resolve jacket"
-                    : $"No jacket found for {song.Id}";
-            }
-            else
-            {
-                _jacketState.Text = "Choose a jacket folder to resolve by song ID";
-            }
+            _jacketState.Text = $"No jacket found for {song.Id}";
             return;
         }
 
         try
         {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
             using var source = Image.FromStream(stream);
             _jacket.Image = new Bitmap(source);
-            _jacketState.Text = _jacketResolver.DisplayPath(path);
+            _jacketState.Text = Path.GetRelativePath(_jacketResolver.RootFolder!, path);
         }
         catch (Exception ex)
         {
-            _jacketState.Text = $"Could not render jacket: {ex.Message}";
+            _jacketState.Text = $"Could not render {Path.GetFileName(path)}: {ex.Message}";
         }
     }
 
@@ -570,9 +563,9 @@ internal sealed class MainForm : Form
         _details.Clear();
         _jacket.Image?.Dispose();
         _jacket.Image = null;
-        _jacketState.Text = string.IsNullOrWhiteSpace(_jacketResolver.RootFolder)
-            ? "Choose a jacket folder to resolve by song ID"
-            : "Select a song";
+        _jacketState.Text = _jacketResolver.IsConfigured
+            ? "Select a song"
+            : "Choose a jacket folder to resolve by song ID";
     }
 
     private void DetachSource()
@@ -583,7 +576,6 @@ internal sealed class MainForm : Form
             "Detach source",
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Question) != DialogResult.Yes) return;
-
         _sources.Remove(doc);
         RefreshSources();
         RebuildMerged();
@@ -596,14 +588,12 @@ internal sealed class MainForm : Form
             MessageBox.Show(this, "Select a source on the left and a song in the table first.", "Detach entry");
             return;
         }
-
         var candidate = doc.Songs.FirstOrDefault(s => SameSong(s, selected));
         if (candidate is null)
         {
             MessageBox.Show(this, "That source does not appear to contain the selected song.", "Detach entry");
             return;
         }
-
         doc.DetachedKeys.Add(candidate.DisplayKey);
         RebuildMerged();
     }
@@ -626,10 +616,8 @@ internal sealed class MainForm : Form
     {
         if (!string.IsNullOrWhiteSpace(a.Id) && !string.IsNullOrWhiteSpace(b.Id))
             return DbSong.Normalize(a.Id) == DbSong.Normalize(b.Id);
-
         return DbSong.Normalize(a.Title) == DbSong.Normalize(b.Title)
-            && (string.IsNullOrWhiteSpace(a.Artist)
-                || string.IsNullOrWhiteSpace(b.Artist)
+            && (string.IsNullOrWhiteSpace(a.Artist) || string.IsNullOrWhiteSpace(b.Artist)
                 || DbSong.Normalize(a.Artist) == DbSong.Normalize(b.Artist));
     }
 
@@ -640,7 +628,6 @@ internal sealed class MainForm : Form
             MessageBox.Show(this, "There is nothing to export yet.");
             return;
         }
-
         using var dialog = new SaveFileDialog
         {
             Filter = "JSON files (*.json)|*.json",
@@ -648,7 +635,6 @@ internal sealed class MainForm : Form
             Title = "Export normalized merged database",
         };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
-
         try
         {
             JsonAdapters.Export(dialog.FileName, _merged);
