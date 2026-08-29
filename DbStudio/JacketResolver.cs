@@ -11,6 +11,7 @@ internal sealed class JacketResolver
 
     public string? RootFolder { get; private set; }
     public int Count => _bySongId.Count;
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(RootFolder);
 
     public void Clear()
     {
