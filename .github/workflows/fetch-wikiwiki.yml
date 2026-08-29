@@ -33,14 +33,27 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-fetch.txt
 
-      - name: Fetch and validate Japanese WikiWiki song index
+      - name: Fetch Japanese WikiWiki song index
         run: |
           mkdir -p build
+          curl -fL --retry 3 \
+            -A "RenderMyMind-ArcaeaDB/0.2 (+https://github.com/thgillwtnorizoh/cheeseburger)" \
+            "https://wikiwiki.jp/arcaea/%E3%82%BF%E3%82%A4%E3%83%88%E3%83%AB%E9%A0%86" \
+            -o build/wikiwiki-title.html
           python tools/fetch_wikis.py wikiwiki-index \
-            --strict \
             --output build/wikiwiki-jp-songs.json
 
-      - name: Print validation summary
+      - name: Upload fetch diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: wikiwiki-jp-songs
+          path: |
+            build/wikiwiki-jp-songs.json
+            build/wikiwiki-title.html
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Validate and print summary
         run: |
           python - <<'PY'
           import json
@@ -54,23 +67,21 @@ jobs:
           print(f"index game version: {data.get('index_game_version')}")
           print(f"rows: {v['parsed_total_rows']}")
           print(f"by kind: {v['parsed_by_kind']}")
-          print(f"declared regular count: {v.get('declared_regular_song_count')}")
+          print(f"declared: {v.get('declared_by_kind')}")
+          print(f"duplicate visible titles: {v.get('duplicate_visible_titles')}")
           print(f"validation ok: {v['ok']}")
 
           songs = data["songs"]
           print("first 5:", [s["title"] for s in songs[:5]])
           print("last 5:", [s["title"] for s in songs[-5:]])
 
-          if not v["ok"]:
-              raise SystemExit("validation failed")
+          for warning in v.get("warnings", []):
+              print("WARNING:", warning)
+          for error in v.get("errors", []):
+              print("ERROR:", error)
+
           if len(songs) < 500:
               raise SystemExit("implausibly small song list")
+          if not v["ok"]:
+              raise SystemExit("validation failed")
           PY
-
-      - name: Upload validated song list
-        uses: actions/upload-artifact@v4
-        with:
-          name: wikiwiki-jp-songs
-          path: build/wikiwiki-jp-songs.json
-          if-no-files-found: error
-          retention-days: 14
