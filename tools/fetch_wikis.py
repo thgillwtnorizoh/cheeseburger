@@ -161,7 +161,9 @@ def choose_song_anchor(cells: list[Any]) -> Any | None:
         for anchor in cell.find_all("a", href=True):
             if same_wiki_song_link(anchor.get("href", "")):
                 text = clean_text(anchor.get_text(" ", strip=True))
-                if text and not text.startswith("#"):
+                # A real Arcaea title can begin with '#': #1f1e33. Anchor
+                # filtering must therefore be based on the URL, not title text.
+                if text:
                     return anchor
     return None
 
