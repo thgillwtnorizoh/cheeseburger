@@ -1,0 +1,76 @@
+name: Validate Arcaea wiki fetch
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/fetch_wikis.py"
+      - "requirements-fetch.txt"
+      - ".github/workflows/fetch-wikiwiki.yml"
+  schedule:
+    - cron: "23 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-wikiwiki-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-fetch.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-fetch.txt
+
+      - name: Fetch and validate Japanese WikiWiki song index
+        run: |
+          mkdir -p build
+          python tools/fetch_wikis.py wikiwiki-index \
+            --strict \
+            --output build/wikiwiki-jp-songs.json
+
+      - name: Print validation summary
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = Path("build/wikiwiki-jp-songs.json")
+          data = json.loads(p.read_text(encoding="utf-8"))
+          v = data["validation"]
+
+          print(f"source: {data['source']}")
+          print(f"index game version: {data.get('index_game_version')}")
+          print(f"rows: {v['parsed_total_rows']}")
+          print(f"by kind: {v['parsed_by_kind']}")
+          print(f"declared regular count: {v.get('declared_regular_song_count')}")
+          print(f"validation ok: {v['ok']}")
+
+          songs = data["songs"]
+          print("first 5:", [s["title"] for s in songs[:5]])
+          print("last 5:", [s["title"] for s in songs[-5:]])
+
+          if not v["ok"]:
+              raise SystemExit("validation failed")
+          if len(songs) < 500:
+              raise SystemExit("implausibly small song list")
+          PY
+
+      - name: Upload validated song list
+        uses: actions/upload-artifact@v4
+        with:
+          name: wikiwiki-jp-songs
+          path: build/wikiwiki-jp-songs.json
+          if-no-files-found: error
+          retention-days: 14
