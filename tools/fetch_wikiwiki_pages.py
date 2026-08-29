@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch individual Arcaea WikiWiki JP song pages and normalize chart data.
-
-This is intentionally separate from fetch_wikis.py's title-index parser so the
-per-song parser can evolve without destabilizing song discovery.
-"""
+"""Fetch individual Arcaea WikiWiki JP song pages and normalize chart data."""
 
 from __future__ import annotations
 
@@ -24,7 +20,7 @@ from bs4 import BeautifulSoup, Tag
 
 ROOT = "https://wikiwiki.jp/arcaea/"
 USER_AGENT = (
-    "RenderMyMind-ArcaeaDB/0.4 "
+    "RenderMyMind-ArcaeaDB/0.5 "
     "(+https://github.com/thgillwtnorizoh/cheeseburger; respectful read-only fetcher)"
 )
 DIFF_NAMES = {
@@ -41,7 +37,6 @@ DIFF_NAMES = {
     "inscribed": "INS",
     "ins": "INS",
 }
-DIFF_WORDS = "Past|Present|Future|Eternal|Beyond|Inscribed"
 
 
 def utc_now() -> str:
@@ -121,9 +116,7 @@ def find_chart_table(soup: BeautifulSoup) -> tuple[Tag | None, list[str]]:
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
             texts = row_texts(tr)
-            if not texts:
-                continue
-            if key(texts[0]).startswith("difficulty"):
+            if texts and key(texts[0]).startswith("difficulty"):
                 diffs = [d for d in (diff_code(v) for v in texts[1:]) if d]
                 if diffs:
                     return table, diffs
@@ -134,9 +127,7 @@ def find_label_value(texts: list[str], label: str) -> str | None:
     target = key(label)
     for i, text in enumerate(texts):
         if key(text) == target:
-            for value in texts[i + 1:]:
-                if clean(value):
-                    return clean(value)
+            return next((clean(v) for v in texts[i + 1:] if clean(v)), None)
     return None
 
 
@@ -155,15 +146,20 @@ def image_from_cell(cell: Tag, base_url: str) -> str | None:
 
 
 def parse_designer_groups(text: str) -> dict[str, str]:
-    """Parse '[Past/Present/Future] X [Beyond] Y' style designer fields."""
     out: dict[str, str] = {}
     groups = list(re.finditer(r"\[([^\]]+)\]", text))
-    for i, match in enumerate(groups):
-        names = [n.strip() for n in re.split(r"[/,]", match.group(1))]
-        codes = [d for d in (diff_code(n) for n in names) if d]
+    diff_groups = [
+        (m, [d for d in (diff_code(n.strip()) for n in re.split(r"[/,]", m.group(1))) if d])
+        for m in groups
+    ]
+    for i, (match, codes) in enumerate(diff_groups):
         if not codes:
             continue
-        end = groups[i + 1].start() if i + 1 < len(groups) else len(text)
+        end = len(text)
+        for later_match, later_codes in diff_groups[i + 1:]:
+            if later_codes:
+                end = later_match.start()
+                break
         designer = clean(text[match.end():end].strip(" /,;:-"))
         designer = re.split(r"(?:アートワーク画像|Artwork)", designer, maxsplit=1, flags=re.I)[0].strip()
         if not designer:
@@ -174,47 +170,40 @@ def parse_designer_groups(text: str) -> dict[str, str]:
 
 
 def parse_constants(soup: BeautifulSoup) -> dict[str, float | None]:
-    """Read 'Difficulty 譜面定数 : x.y' from the guide section.
+    """Parse chart constants from rendered document order.
 
-    WikiWiki wraps the difficulty and the number in nested spans, so parsing a
-    single text node is unreliable. We inspect the nearest list item first,
-    then use a bounded whole-page fallback.
+    WikiWiki's nested list HTML can make later difficulty bullets descendants
+    of earlier bullets. Parent-node parsing therefore leaks values upward.
+    Line-order parsing associates each constant with the nearest short
+    difficulty label immediately before it instead.
     """
+    lines = [clean(line) for line in soup.get_text("\n", strip=True).splitlines() if clean(line)]
     out: dict[str, float | None] = {}
 
-    for node in soup.find_all(string=lambda s: isinstance(s, str) and "譜面定数" in s):
-        parent: Tag | None = node.parent if isinstance(node.parent, Tag) else None
-        candidates: list[Tag] = []
-        cur = parent
-        for _ in range(5):
-            if cur is None:
-                break
-            candidates.append(cur)
-            if cur.name == "li":
-                break
-            cur = cur.parent if isinstance(cur.parent, Tag) else None
-
-        for container in candidates:
-            text = clean(container.get_text(" ", strip=True))
-            code = diff_code(text)
-            if not code or "譜面定数" not in text:
-                continue
-            m = re.search(r"譜面定数\s*[:：]\s*(未判明|\d{1,2}(?:\.\d+)?)", text)
-            if not m:
-                continue
-            raw = m.group(1)
-            out[code] = None if raw == "未判明" else float(raw)
-            break
-
-    # Fallback for pages whose list markup is unusual. Temper the match so one
-    # difficulty cannot leap across another difficulty heading.
-    page_text = clean(soup.get_text(" ", strip=True))
-    guarded = rf"\b({DIFF_WORDS})\b(?:(?!\b(?:{DIFF_WORDS})\b).){{0,180}}?譜面定数\s*[:：]\s*(未判明|\d{{1,2}}(?:\.\d+)?)"
-    for m in re.finditer(guarded, page_text, re.I):
-        code = diff_code(m.group(1))
-        if not code or code in out:
+    for i, line in enumerate(lines):
+        if "譜面定数" not in line:
             continue
-        out[code] = None if m.group(2) == "未判明" else float(m.group(2))
+
+        window_after = " ".join(lines[i:i + 3])
+        m = re.search(r"譜面定数\s*[:：]\s*(未判明|\d{1,2}(?:\.\d+)?)", window_after)
+        if not m:
+            continue
+
+        code = diff_code(line)
+        if code is None:
+            for j in range(i - 1, max(-1, i - 6), -1):
+                candidate = lines[j]
+                if len(candidate) > 32:
+                    continue
+                candidate_code = diff_code(candidate)
+                if candidate_code:
+                    code = candidate_code
+                    break
+        if code is None:
+            continue
+
+        raw = m.group(1)
+        out[code] = None if raw == "未判明" else float(raw)
 
     return out
 
@@ -258,8 +247,6 @@ def parse_page(page_html: str, url: str, requested_title: str | None = None) -> 
                         artwork = image_from_cell(cells[i + 1], url) or artwork
 
             if label.startswith("chartdesigner"):
-                # Only consume the designer value. Artwork is often another
-                # cell on the same row and must not leak into the designer.
                 raw_parts = []
                 for value in texts[1:]:
                     if key(value) == "artwork":
@@ -268,18 +255,15 @@ def parse_page(page_html: str, url: str, requested_title: str | None = None) -> 
                 designers.update(parse_designer_groups(" ".join(raw_parts)))
 
             elif label == "level":
-                for diff, value in zip(diffs, texts[1:], strict=False):
-                    charts[diff]["level"] = parse_level(value)
+                for d, value in zip(diffs, texts[1:], strict=False):
+                    charts[d]["level"] = parse_level(value)
 
             elif label == "notes":
-                # Deliberately exact. Testify has a separate 'Notes (Joy-Con)'
-                # row which must not overwrite the mobile chart note counts.
-                for diff, value in zip(diffs, texts[1:], strict=False):
-                    charts[diff]["notes"] = parse_int(value)
+                for d, value in zip(diffs, texts[1:], strict=False):
+                    charts[d]["notes"] = parse_int(value)
 
             elif label == "length":
-                joined = " ".join(texts[1:])
-                m = re.search(r"\b\d{1,2}:\d{2}\b", joined)
+                m = re.search(r"\b\d{1,2}:\d{2}\b", " ".join(texts[1:]))
                 if m:
                     length = m.group(0)
 
@@ -353,7 +337,7 @@ def parse_page(page_html: str, url: str, requested_title: str | None = None) -> 
             "source_url": url,
             "fetched_at": utc_now(),
             "source_updated_at": last_modified(soup),
-            "parser_version": "0.4.0",
+            "parser_version": "0.5.0",
             "artwork_credit": artwork_credit,
             "missing_constants": missing_constants,
             "missing_notes": missing_notes,
@@ -369,11 +353,9 @@ def build_url(title_or_page: str) -> str:
 def select_entries(index: dict[str, Any] | None, titles: list[str], all_entries: bool) -> list[dict[str, Any]]:
     if index is None:
         return [{"title": t, "page": t, "url": build_url(t)} for t in titles]
-
     songs = list(index.get("songs", []))
     if all_entries:
         return songs
-
     wanted = {key(t) for t in titles}
     selected = [s for s in songs if key(s.get("title", "")) in wanted or key(s.get("page", "")) in wanted]
     matched = {key(s.get("title", "")) for s in selected} | {key(s.get("page", "")) for s in selected}
@@ -387,7 +369,6 @@ def fetch_pages(client: Client, entries: Iterable[dict[str, Any]], delay: float,
     entries = list(entries)
     if max_pages is not None:
         entries = entries[:max_pages]
-
     records: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     for i, entry in enumerate(entries):
@@ -452,10 +433,7 @@ def main() -> int:
         sys.stdout.write(text)
 
     v = result["validation"]
-    print(
-        f"WikiWiki pages: requested={v['requested']} parsed={v['parsed']} failed={v['failed']} invalid={len(v['invalid'])}",
-        file=sys.stderr,
-    )
+    print(f"WikiWiki pages: requested={v['requested']} parsed={v['parsed']} failed={v['failed']} invalid={len(v['invalid'])}", file=sys.stderr)
     return 2 if args.strict and not v["ok"] else 0
 
 
