@@ -202,7 +202,7 @@ internal static class JsonAdapters
                 ["_meta"] = new JsonObject
                 {
                     ["source_url"] = song.SourceUrl,
-                    ["sources"] = new JsonArray(song.Sources.OrderBy(x => x).Select(JsonValue.Create).ToArray()),
+                    ["sources"] = new JsonArray(song.Sources.OrderBy(x => x).Select(s => (JsonNode?)JsonValue.Create(s)).ToArray()),
                 },
             });
         }
