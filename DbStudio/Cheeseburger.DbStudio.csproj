@@ -8,4 +8,9 @@
     <RootNamespace>Cheeseburger.DbStudio</RootNamespace>
     <AssemblyName>Cheeseburger.DbStudio</AssemblyName>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.3.0" />
+    <PackageReference Include="NAudio.Vorbis" Version="1.5.0" />
+  </ItemGroup>
 </Project>
