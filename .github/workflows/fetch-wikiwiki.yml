@@ -15,9 +15,9 @@ permissions:
   contents: read
 
 jobs:
-  fetch-wikiwiki-index:
+  fetch-wikiwiki:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -36,52 +36,89 @@ jobs:
       - name: Fetch Japanese WikiWiki song index
         run: |
           mkdir -p build
-          curl -fL --retry 3 \
-            -A "RenderMyMind-ArcaeaDB/0.2 (+https://github.com/thgillwtnorizoh/cheeseburger)" \
-            "https://wikiwiki.jp/arcaea/%E3%82%BF%E3%82%A4%E3%83%88%E3%83%AB%E9%A0%86" \
-            -o build/wikiwiki-title.html
           python tools/fetch_wikis.py wikiwiki-index \
+            --strict \
             --output build/wikiwiki-jp-songs.json
 
-      - name: Upload fetch diagnostics
-        uses: actions/upload-artifact@v4
-        with:
-          name: wikiwiki-jp-songs
-          path: |
-            build/wikiwiki-jp-songs.json
-            build/wikiwiki-title.html
-          if-no-files-found: error
-          retention-days: 14
+      - name: Fetch representative song pages
+        run: |
+          python tools/fetch_wikis.py wikiwiki-pages \
+            --strict \
+            --index build/wikiwiki-jp-songs.json \
+            --title "Purgatorium" \
+            --title "#1f1e33" \
+            --title "Testify" \
+            --title "DEINOS PHAINEIN" \
+            --delay 0.15 \
+            --output build/wikiwiki-jp-page-samples.json
 
-      - name: Validate and print summary
+      - name: Validate known page values
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          p = Path("build/wikiwiki-jp-songs.json")
-          data = json.loads(p.read_text(encoding="utf-8"))
-          v = data["validation"]
+          index = json.loads(Path("build/wikiwiki-jp-songs.json").read_text(encoding="utf-8"))
+          pages = json.loads(Path("build/wikiwiki-jp-page-samples.json").read_text(encoding="utf-8"))
 
-          print(f"source: {data['source']}")
-          print(f"index game version: {data.get('index_game_version')}")
-          print(f"rows: {v['parsed_total_rows']}")
-          print(f"by kind: {v['parsed_by_kind']}")
-          print(f"declared: {v.get('declared_by_kind')}")
-          print(f"duplicate visible titles: {v.get('duplicate_visible_titles')}")
-          print(f"validation ok: {v['ok']}")
+          iv = index["validation"]
+          pv = pages["validation"]
+          print("index rows:", iv["parsed_total_rows"])
+          print("index by kind:", iv["parsed_by_kind"])
+          print("page fetch:", pv)
 
-          songs = data["songs"]
-          print("first 5:", [s["title"] for s in songs[:5]])
-          print("last 5:", [s["title"] for s in songs[-5:]])
+          if not iv["ok"]:
+              raise SystemExit("index validation failed")
+          if not pv["ok"]:
+              raise SystemExit("page parser validation failed")
 
-          for warning in v.get("warnings", []):
-              print("WARNING:", warning)
-          for error in v.get("errors", []):
-              print("ERROR:", error)
+          by_title = {r["song"]["title"]: r for r in pages["songs"]}
 
-          if len(songs) < 500:
-              raise SystemExit("implausibly small song list")
-          if not v["ok"]:
-              raise SystemExit("validation failed")
+          def chart(title, diff):
+              return by_title[title]["charts"][diff]
+
+          # Long-stable values give us hard parser assertions rather than a
+          # weak 'the page returned 200' test.
+          assert chart("Purgatorium", "PST")["notes"] == 609
+          assert chart("Purgatorium", "PST")["constant"] == 2.5
+          assert chart("Purgatorium", "PRS")["notes"] == 641
+          assert chart("Purgatorium", "PRS")["constant"] == 6.0
+          assert chart("Purgatorium", "FTR")["notes"] == 983
+          assert chart("Purgatorium", "FTR")["constant"] == 8.4
+          assert chart("Purgatorium", "BYD")["notes"] == 1051
+          assert chart("Purgatorium", "BYD")["constant"] == 9.6
+
+          deinos = by_title["DEINOS PHAINEIN"]
+          assert deinos["song"]["bpm"] == 190
+          assert deinos["song"]["length"] == "2:48"
+          assert deinos["song"]["added_version"] == "7.0.0"
+          assert chart("DEINOS PHAINEIN", "FTR")["level"] == "10+"
+          assert chart("DEINOS PHAINEIN", "FTR")["notes"] == 1888
+          assert chart("DEINOS PHAINEIN", "FTR")["constant"] == 10.9
+          assert chart("DEINOS PHAINEIN", "INS")["level"] == "12"
+          assert chart("DEINOS PHAINEIN", "INS")["notes"] == 2228
+          assert chart("DEINOS PHAINEIN", "INS")["constant"] == 12.0
+          assert set(deinos["_meta"]["missing_constants"]) == {"PST", "PRS"}
+
+          # Regression checks for awkward titles and a high-difficulty page.
+          assert "#1f1e33" in by_title
+          assert by_title["#1f1e33"]["charts"]
+          assert "Testify" in by_title
+          assert any(c.get("notes") for c in by_title["Testify"]["charts"].values())
+
+          print("Purgatorium:", by_title["Purgatorium"]["charts"])
+          print("DEINOS:", deinos["charts"])
+          print("DEINOS missing constants:", deinos["_meta"]["missing_constants"])
+          print("all page assertions passed")
           PY
+
+      - name: Upload fetch diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wikiwiki-jp-fetch
+          path: |
+            build/wikiwiki-jp-songs.json
+            build/wikiwiki-jp-page-samples.json
+          if-no-files-found: warn
+          retention-days: 14
