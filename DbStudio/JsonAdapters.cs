@@ -63,6 +63,9 @@ internal static class JsonAdapters
             AddedVersion = Str(songObj, "added_version"),
             SourceUrl = Str(entry["_meta"] as JsonObject, "source_url"),
         };
+        song.TitleAliases.Add(song.Title);
+        AddStringArray(song.TitleAliases, songObj["title_aliases"]);
+        AddLocalizedValues(song.TitleAliases, songObj["title_localized"]);
         song.Sources.Add(Str(entry, "source") ?? sourceName);
 
         if (entry["charts"] is JsonObject charts)
@@ -70,14 +73,25 @@ internal static class JsonAdapters
             foreach (var (diff, node) in charts)
             {
                 if (node is not JsonObject c) continue;
-                song.Charts[diff] = new ChartInfo
+                var chart = new ChartInfo
                 {
                     Difficulty = diff,
                     Level = Scalar(c["level"]),
                     Constant = Number(c["constant"]),
                     Notes = Integer(c["notes"]),
                     ChartDesigner = Str(c, "chart_designer"),
+                    VariantTitle = Str(c, "variant_title"),
+                    VariantArtist = Str(c, "variant_artist"),
+                    VariantBpm = Scalar(c["variant_bpm"]),
+                    VariantAddedVersion = Str(c, "variant_added_version"),
+                    Background = Str(c, "background"),
+                    ReleaseDate = Scalar(c["release_date"]),
+                    AudioOverride = Boolean(c["audio_override"]),
+                    JacketOverride = Boolean(c["jacket_override"]),
                 };
+                AddStringArray(chart.VariantTitleAliases, c["variant_title_aliases"]);
+                if (!string.IsNullOrWhiteSpace(chart.VariantTitle)) chart.VariantTitleAliases.Add(chart.VariantTitle);
+                song.Charts[diff] = chart;
             }
         }
         return song;
@@ -96,6 +110,9 @@ internal static class JsonAdapters
             AddedVersion = Scalar(obj["version"]),
             Side = Scalar(obj["side"]),
         };
+        song.TitleAliases.Add(title);
+        AddLocalizedValues(song.TitleAliases, obj["title_localized"]);
+        AddSearchValues(song.TitleAliases, obj["search_title"]);
         song.Sources.Add(sourceName);
 
         if (obj["difficulties"] is JsonArray diffs)
@@ -117,14 +134,26 @@ internal static class JsonAdapters
                 };
                 var rating = Integer(node["rating"]);
                 var plus = node["ratingPlus"]?.GetValue<bool?>() == true;
-                song.Charts[diff] = new ChartInfo
+                var chart = new ChartInfo
                 {
                     Difficulty = diff,
                     Level = rating is null ? null : rating.Value.ToString(CultureInfo.InvariantCulture) + (plus ? "+" : ""),
                     Constant = Number(node["constant"]),
                     Notes = Integer(node["notes"]) ?? Integer(node["note_count"]),
                     ChartDesigner = Str(node, "chartDesigner") ?? Str(node, "designer"),
+                    VariantTitle = Localized(node["title_localized"]) ?? Str(node, "title"),
+                    VariantArtist = Str(node, "artist"),
+                    VariantBpm = Scalar(node["bpm"]) ?? Scalar(node["bpm_base"]),
+                    VariantAddedVersion = Scalar(node["version"]),
+                    Background = Str(node, "bg"),
+                    ReleaseDate = Scalar(node["date"]),
+                    AudioOverride = Boolean(node["audioOverride"]),
+                    JacketOverride = Boolean(node["jacketOverride"]),
                 };
+                AddLocalizedValues(chart.VariantTitleAliases, node["title_localized"]);
+                AddSearchValues(chart.VariantTitleAliases, node["search_title"]);
+                if (!string.IsNullOrWhiteSpace(chart.VariantTitle)) chart.VariantTitleAliases.Add(chart.VariantTitle);
+                song.Charts[diff] = chart;
             }
         }
         return song;
@@ -158,11 +187,17 @@ internal static class JsonAdapters
             var byUrl = existing.FirstOrDefault(x => string.Equals(x.SourceUrl, incoming.SourceUrl, StringComparison.OrdinalIgnoreCase));
             if (byUrl is not null) return byUrl;
         }
-        var titleMatches = existing.Where(x => DbSong.Normalize(x.Title) == DbSong.Normalize(incoming.Title)).ToList();
+
+        // Identity matching is localization-aware in both directions. This lets
+        // songlist "Hikari" (alias 光) match a WikiWiki entry titled 光, even if
+        // either source was loaded first. Difficulty-localized titles such as
+        // Axium Divergence are also considered, but remain chart-scoped metadata.
+        var titleMatches = existing.Where(x => x.SharesTitleIdentity(incoming)).ToList();
         if (titleMatches.Count == 1) return titleMatches[0];
         if (!string.IsNullOrWhiteSpace(incoming.Artist))
         {
-            return titleMatches.FirstOrDefault(x => DbSong.Normalize(x.Artist) == DbSong.Normalize(incoming.Artist));
+            var byArtist = titleMatches.Where(x => x.MatchesArtist(incoming.Artist)).ToList();
+            if (byArtist.Count == 1) return byArtist[0];
         }
         return null;
     }
@@ -181,6 +216,15 @@ internal static class JsonAdapters
                     ["constant"] = c.Constant,
                     ["notes"] = c.Notes,
                     ["chart_designer"] = c.ChartDesigner,
+                    ["variant_title"] = c.VariantTitle,
+                    ["variant_title_aliases"] = ToJsonArray(c.VariantTitleAliases),
+                    ["variant_artist"] = c.VariantArtist,
+                    ["variant_bpm"] = c.VariantBpm,
+                    ["variant_added_version"] = c.VariantAddedVersion,
+                    ["background"] = c.Background,
+                    ["release_date"] = c.ReleaseDate,
+                    ["audio_override"] = c.AudioOverride,
+                    ["jacket_override"] = c.JacketOverride,
                 };
             }
             entries.Add(new JsonObject
@@ -190,6 +234,7 @@ internal static class JsonAdapters
                 {
                     ["id"] = song.Id,
                     ["title"] = song.Title,
+                    ["title_aliases"] = ToJsonArray(song.TitleAliases),
                     ["artist"] = song.Artist,
                     ["pack"] = song.Pack,
                     ["bpm"] = song.Bpm,
@@ -216,13 +261,88 @@ internal static class JsonAdapters
         File.WriteAllText(path, root.ToJsonString(Pretty));
     }
 
+    public static void SelfTest()
+    {
+        var hikariObj = JsonNode.Parse("""
+        {
+          "id":"hikari",
+          "title_localized":{"ja":"光","en":"Hikari"},
+          "artist":"THB",
+          "difficulties":[{"ratingClass":0,"rating":2},{"ratingClass":1,"rating":6},{"ratingClass":2,"rating":8}]
+        }
+        """)!.AsObject();
+        var hikari = ParseSonglistSong(hikariObj, "songlist");
+        if (!hikari.MatchesTitle("光")) throw new InvalidDataException("Localized title alias self-test failed.");
+
+        var wikiHikari = ParseNormalizedEntry(JsonNode.Parse("""
+        {
+          "source":"arcaea_wikiwiki_jp",
+          "song":{"title":"光","artist":"THB"},
+          "charts":{"FTR":{"level":"8","constant":8.1,"notes":684}}
+        }
+        """)!.AsObject(), "wiki");
+        var mergedHikari = Merge(new[]
+        {
+            new SourceDocument { Name = "songlist", Kind = "songlist", Songs = new() { hikari } },
+            new SourceDocument { Name = "wiki", Kind = "wiki", Songs = new() { wikiHikari } },
+        });
+        if (mergedHikari.Count != 1 || mergedHikari[0].Id != "hikari" || mergedHikari[0].Title != "Hikari")
+            throw new InvalidDataException("Localized merge self-test failed.");
+
+        var axiumObj = JsonNode.Parse("""
+        {
+          "id":"axiumcrisis",
+          "title_localized":{"en":"Axium Crisis"},
+          "artist":"ak+q",
+          "bpm":"170",
+          "version":"1.5",
+          "difficulties":[
+            {"ratingClass":2,"rating":10},
+            {"ratingClass":3,"title_localized":{"en":"Axium Divergence"},"artist":"ak+q (lowiro)","bpm":"170?","bpm_base":180,"audioOverride":true,"jacketOverride":true,"bg":"axiumcrisis3","rating":11,"version":"6.13"}
+          ]
+        }
+        """)!.AsObject();
+        var axium = ParseSonglistSong(axiumObj, "songlist");
+        if (!axium.HasBeyondVariant || axium.DisplayTitle != "Axium Crisis | Axium Divergence")
+            throw new InvalidDataException("Beyond variant self-test failed.");
+        if (!axium.MatchesTitle("Axium Divergence") || axium.BeyondVariant?.VariantBpm != "170?")
+            throw new InvalidDataException("Beyond variant metadata self-test failed.");
+    }
+
     private static string? Str(JsonObject? o, string name) => o?[name]?.GetValue<string?>();
+
     private static string? Localized(JsonNode? n)
     {
         if (n is not JsonObject o) return null;
         foreach (var key in new[] { "en", "ja", "ko" }) if (o[key]?.GetValue<string?>() is { Length: > 0 } s) return s;
         return o.Select(x => x.Value?.GetValue<string?>()).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
     }
+
+    private static void AddLocalizedValues(HashSet<string> target, JsonNode? node)
+    {
+        if (node is not JsonObject obj) return;
+        foreach (var value in obj.Select(x => x.Value?.GetValue<string?>()).Where(x => !string.IsNullOrWhiteSpace(x)))
+            target.Add(value!);
+    }
+
+    private static void AddSearchValues(HashSet<string> target, JsonNode? node)
+    {
+        if (node is not JsonObject obj) return;
+        foreach (var array in obj.Select(x => x.Value).OfType<JsonArray>())
+            foreach (var value in array.Select(x => x?.GetValue<string?>()).Where(x => !string.IsNullOrWhiteSpace(x)))
+                target.Add(value!);
+    }
+
+    private static void AddStringArray(HashSet<string> target, JsonNode? node)
+    {
+        if (node is not JsonArray array) return;
+        foreach (var value in array.Select(x => x?.GetValue<string?>()).Where(x => !string.IsNullOrWhiteSpace(x)))
+            target.Add(value!);
+    }
+
+    private static JsonArray ToJsonArray(IEnumerable<string> values)
+        => new(values.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).Select(x => (JsonNode?)JsonValue.Create(x)).ToArray());
+
     private static string? Scalar(JsonNode? n)
     {
         if (n is null) return null;
@@ -231,9 +351,11 @@ internal static class JsonAdapters
             if (v.TryGetValue<string>(out var s)) return s;
             if (v.TryGetValue<double>(out var d)) return d.ToString(CultureInfo.InvariantCulture);
             if (v.TryGetValue<int>(out var i)) return i.ToString(CultureInfo.InvariantCulture);
+            if (v.TryGetValue<long>(out var l)) return l.ToString(CultureInfo.InvariantCulture);
         }
         return n.ToJsonString();
     }
+
     private static double? Number(JsonNode? n)
     {
         if (n is not JsonValue v) return null;
@@ -241,11 +363,20 @@ internal static class JsonAdapters
         if (v.TryGetValue<string>(out var s) && double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return d;
         return null;
     }
+
     private static int? Integer(JsonNode? n)
     {
         if (n is not JsonValue v) return null;
         if (v.TryGetValue<int>(out var i)) return i;
         if (v.TryGetValue<string>(out var s) && int.TryParse(s, out i)) return i;
         return null;
+    }
+
+    private static bool Boolean(JsonNode? n)
+    {
+        if (n is not JsonValue v) return false;
+        if (v.TryGetValue<bool>(out var b)) return b;
+        if (v.TryGetValue<string>(out var s) && bool.TryParse(s, out b)) return b;
+        return false;
     }
 }

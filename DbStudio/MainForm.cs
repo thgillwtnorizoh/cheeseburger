@@ -2,6 +2,9 @@ namespace Cheeseburger.DbStudio;
 
 internal sealed class MainForm : Form
 {
+    private static readonly Color NormalVariantColor = ColorTranslator.FromHtml("#53365e");
+    private static readonly Color BeyondVariantColor = ColorTranslator.FromHtml("#6d1b35");
+
     private readonly List<SourceDocument> _sources = new();
     private readonly HashSet<string> _hiddenSongs = new(StringComparer.OrdinalIgnoreCase);
     private readonly JacketResolver _jacketResolver = new();
@@ -9,6 +12,8 @@ internal sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _searchDebounce = new() { Interval = 120 };
     private List<DbSong> _merged = new();
     private bool _refreshingGrid;
+    private string? _detailSongKey;
+    private string? _detailVariantDifficulty;
 
     private readonly ListBox _sourceList = new()
     {
@@ -23,7 +28,7 @@ internal sealed class MainForm : Form
     private readonly TextBox _search = new()
     {
         Dock = DockStyle.Fill,
-        PlaceholderText = "Search title / artist / pack / song ID...",
+        PlaceholderText = "Search title / localized title / artist / pack / song ID...",
         BorderStyle = BorderStyle.FixedSingle,
         BackColor = UiTheme.PanelAlt,
         ForeColor = UiTheme.Text,
@@ -109,11 +114,7 @@ internal sealed class MainForm : Form
         AutoScaleMode = AutoScaleMode.Dpi;
         ResizeRedraw = true;
 
-        SetStyle(
-            ControlStyles.AllPaintingInWmPaint
-            | ControlStyles.OptimizedDoubleBuffer
-            | ControlStyles.ResizeRedraw,
-            true);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
         BuildColumns();
         BuildLayout();
@@ -184,8 +185,7 @@ internal sealed class MainForm : Form
         AddFillColumn("Artist", "Artist", 17, 110);
         AddFillColumn("Pack", "Pack", 11, 70);
         AddFillColumn("Ver", "Version", 6, 45);
-        foreach (var diff in new[] { "PST", "PRS", "FTR", "ETR", "BYD", "INS" })
-            AddFillColumn(diff, diff, 8, 52);
+        foreach (var diff in new[] { "PST", "PRS", "FTR", "ETR", "BYD", "INS" }) AddFillColumn(diff, diff, 8, 52);
         AddFillColumn("Sources", "Sources", 12, 80);
     }
 
@@ -375,8 +375,7 @@ internal sealed class MainForm : Form
         _grid.CellDoubleClick += (_, e) =>
         {
             if (e.RowIndex < 0) return;
-            if (e.ColumnIndex >= 0)
-                _grid.CurrentCell = _grid.Rows[e.RowIndex].Cells[e.ColumnIndex];
+            if (e.ColumnIndex >= 0) _grid.CurrentCell = _grid.Rows[e.RowIndex].Cells[e.ColumnIndex];
             TogglePreview();
         };
         _grid.CellFormatting += (_, e) =>
@@ -390,8 +389,7 @@ internal sealed class MainForm : Form
         _grid.CellToolTipTextNeeded += (_, e) =>
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) return;
-            if (_grid.Columns[e.ColumnIndex].Name == "Jacket"
-                && _grid.Rows[e.RowIndex].Tag is DbSong song)
+            if (_grid.Columns[e.ColumnIndex].Name == "Jacket" && _grid.Rows[e.RowIndex].Tag is DbSong song)
             {
                 var jacket = _jacketResolver.Resolve(song.Id);
                 var preview = _jacketResolver.ResolvePreview(song.Id);
@@ -399,11 +397,14 @@ internal sealed class MainForm : Form
                 {
                     jacket is null ? null : $"Jacket: {_jacketResolver.DisplayPath(jacket)}",
                     preview is null ? null : $"Preview: {_jacketResolver.DisplayPath(preview)}",
+                    song.HasBeyondVariant ? "Beyond variant available in detail preview" : null,
                 }.Where(x => x is not null));
                 return;
             }
             e.ToolTipText = Convert.ToString(_grid.Rows[e.RowIndex].Cells[e.ColumnIndex].Value) ?? string.Empty;
         };
+        _jacket.Click += (_, _) => ToggleJacketVariant();
+        _jacket.Paint += (_, e) => PaintVariantTriangle(e.Graphics);
         _previewPlayer.PlaybackStopped += (_, _) => PreviewStoppedFromAnyThread();
     }
 
@@ -442,7 +443,7 @@ internal sealed class MainForm : Form
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Choose the master jacket/preview folder. Jackets: <songid>.png/.jpg or <songid>/base|1080_base. Previews: <songid>.<audio> or <songid>/preview|base.<audio>. dl_<songid> folders are also supported.",
+            Description = "Choose the master jacket/preview folder. Jackets: <songid>.png/.jpg or <songid>/base|1080_base. Beyond variants also accept 3|1080_3 (and byd aliases). Previews: <songid>.<audio> or <songid>/preview|base.<audio>; Beyond audio accepts 3.<audio>. dl_<songid> folders are also supported.",
             UseDescriptionForTitle = true,
             ShowNewFolderButton = false,
             SelectedPath = _jacketResolver.RootFolder ?? string.Empty,
@@ -476,8 +477,7 @@ internal sealed class MainForm : Form
         _sourceList.Items.Clear();
         foreach (var source in _sources) _sourceList.Items.Add(source);
         _sourceList.EndUpdate();
-        if (_sourceList.Items.Count > 0)
-            _sourceList.SelectedIndex = Math.Clamp(selected, 0, _sourceList.Items.Count - 1);
+        if (_sourceList.Items.Count > 0) _sourceList.SelectedIndex = Math.Clamp(selected, 0, _sourceList.Items.Count - 1);
     }
 
     private void RebuildMerged()
@@ -502,7 +502,7 @@ internal sealed class MainForm : Form
         var q = DbSong.Normalize(_search.Text);
         var visible = string.IsNullOrWhiteSpace(q)
             ? _merged
-            : _merged.Where(s => DbSong.Normalize($"{s.Title} {s.Artist} {s.Pack} {s.Id}").Contains(q)).ToList();
+            : _merged.Where(s => DbSong.Normalize(s.SearchText).Contains(q)).ToList();
 
         _refreshingGrid = true;
         _grid.SuspendLayout();
@@ -514,7 +514,7 @@ internal sealed class MainForm : Form
             var values = new List<object?>
             {
                 null,
-                song.Title,
+                song.DisplayTitle,
                 song.Artist,
                 song.Pack,
                 song.AddedVersion,
@@ -526,11 +526,10 @@ internal sealed class MainForm : Form
             var rowIndex = _grid.Rows.Add(values.ToArray());
             var row = _grid.Rows[rowIndex];
             row.Tag = song;
-            if (selectedKey is not null
-                && string.Equals(song.DisplayKey, selectedKey, StringComparison.OrdinalIgnoreCase))
-                rowToSelect = row;
+            if (selectedKey is not null && string.Equals(song.DisplayKey, selectedKey, StringComparison.OrdinalIgnoreCase)) rowToSelect = row;
         }
 
+        _grid.ApplyCurrentSort();
         _grid.ResumeLayout();
         _refreshingGrid = false;
 
@@ -564,8 +563,46 @@ internal sealed class MainForm : Form
             return;
         }
 
-        _details.Text = song.DetailText();
+        if (!string.Equals(_detailSongKey, song.DisplayKey, StringComparison.OrdinalIgnoreCase))
+        {
+            _detailSongKey = song.DisplayKey;
+            _detailVariantDifficulty = null;
+        }
+        if (!song.HasBeyondVariant) _detailVariantDifficulty = null;
+
+        _details.Text = song.DetailText(_detailVariantDifficulty);
         LoadJacket(song);
+        _jacket.Cursor = song.HasBeyondVariant ? Cursors.Hand : Cursors.Default;
+        _jacket.Invalidate();
+    }
+
+    private void ToggleJacketVariant()
+    {
+        var song = SelectedSong();
+        if (song is null || !song.HasBeyondVariant) return;
+        _detailVariantDifficulty = string.Equals(_detailVariantDifficulty, "BYD", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : "BYD";
+        _details.Text = song.DetailText(_detailVariantDifficulty);
+        LoadJacket(song);
+        _jacket.Invalidate();
+    }
+
+    private void PaintVariantTriangle(Graphics graphics)
+    {
+        var song = SelectedSong();
+        if (song is null || !song.HasBeyondVariant || _jacket.Width < 8 || _jacket.Height < 8) return;
+        var size = Math.Min(28, Math.Max(16, Math.Min(_jacket.Width, _jacket.Height) / 7));
+        var points = new[]
+        {
+            new Point(_jacket.ClientSize.Width - 1, 1),
+            new Point(_jacket.ClientSize.Width - 1, size),
+            new Point(_jacket.ClientSize.Width - size, 1),
+        };
+        using var brush = new SolidBrush(string.Equals(_detailVariantDifficulty, "BYD", StringComparison.OrdinalIgnoreCase)
+            ? BeyondVariantColor
+            : NormalVariantColor);
+        graphics.FillPolygon(brush, points);
     }
 
     private void LoadJacket(DbSong song)
@@ -575,7 +612,9 @@ internal sealed class MainForm : Form
 
         if (!_jacketResolver.IsConfigured)
         {
-            _jacketState.Text = "Choose a jacket/preview folder to resolve media by song ID";
+            _jacketState.Text = song.HasBeyondVariant
+                ? "Click jacket to switch Normal / Beyond view; choose a media folder to show local jackets"
+                : "Choose a jacket/preview folder to resolve media by song ID";
             return;
         }
         if (string.IsNullOrWhiteSpace(song.Id))
@@ -584,8 +623,10 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var jacketPath = _jacketResolver.Resolve(song.Id);
-        var previewPath = _jacketResolver.ResolvePreview(song.Id);
+        var variant = string.Equals(_detailVariantDifficulty, "BYD", StringComparison.OrdinalIgnoreCase) ? "BYD" : null;
+        var jacketPath = _jacketResolver.Resolve(song.Id, variant);
+        var previewPath = _jacketResolver.ResolvePreview(song.Id, variant);
+        var exactBeyond = variant is null ? null : _jacketResolver.ResolveExactBeyond(song.Id);
 
         if (jacketPath is not null)
         {
@@ -604,7 +645,14 @@ internal sealed class MainForm : Form
 
         var jacketText = jacketPath is null ? "No jacket" : $"Jacket: {_jacketResolver.DisplayPath(jacketPath)}";
         var previewText = previewPath is null ? "No preview" : $"Preview: {_jacketResolver.DisplayPath(previewPath)}";
-        _jacketState.Text = $"{jacketText}   |   {previewText}";
+        var viewText = song.HasBeyondVariant
+            ? variant is null
+                ? "Normal • click jacket for Beyond"
+                : exactBeyond is null
+                    ? "Beyond • local Beyond jacket missing; showing base • click for Normal"
+                    : "Beyond • click jacket for Normal"
+            : null;
+        _jacketState.Text = string.Join("   |   ", new[] { viewText, jacketText, previewText }.Where(x => !string.IsNullOrWhiteSpace(x)));
     }
 
     private void TogglePreview()
@@ -624,17 +672,21 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var previewPath = _jacketResolver.ResolvePreview(song.Id);
+        var variant = song.HasBeyondVariant && string.Equals(_detailVariantDifficulty, "BYD", StringComparison.OrdinalIgnoreCase)
+            ? "BYD"
+            : null;
+        var previewPath = _jacketResolver.ResolvePreview(song.Id, variant);
         if (previewPath is null)
         {
-            UpdateStatus($"No preview found for {song.Title}");
+            UpdateStatus($"No preview found for {(variant is null ? song.Title : song.BeyondVariant?.VariantTitle ?? song.Title)}");
             return;
         }
 
         try
         {
             _previewPlayer.Play(previewPath);
-            UpdateStatus($"Playing preview: {song.Title}   |   double-click to fade out");
+            var playingTitle = variant is null ? song.Title : song.BeyondVariant?.VariantTitle ?? song.Title;
+            UpdateStatus($"Playing preview: {playingTitle}   |   double-click to fade out");
         }
         catch (Exception ex)
         {
@@ -652,10 +704,8 @@ internal sealed class MainForm : Form
         if (IsDisposed || Disposing) return;
         try
         {
-            if (InvokeRequired)
-                BeginInvoke(new Action(() => UpdateStatus("Preview stopped")));
-            else
-                UpdateStatus("Preview stopped");
+            if (InvokeRequired) BeginInvoke(new Action(() => UpdateStatus("Preview stopped")));
+            else UpdateStatus("Preview stopped");
         }
         catch
         {
@@ -665,12 +715,16 @@ internal sealed class MainForm : Form
 
     private void ClearDetails()
     {
+        _detailSongKey = null;
+        _detailVariantDifficulty = null;
         _details.Clear();
         _jacket.Image?.Dispose();
         _jacket.Image = null;
+        _jacket.Cursor = Cursors.Default;
         _jacketState.Text = _jacketResolver.IsConfigured
             ? "Select a song"
             : "Choose a jacket/preview folder to resolve media by song ID";
+        _jacket.Invalidate();
     }
 
     private void DetachSource()
@@ -721,9 +775,9 @@ internal sealed class MainForm : Form
     {
         if (!string.IsNullOrWhiteSpace(a.Id) && !string.IsNullOrWhiteSpace(b.Id))
             return DbSong.Normalize(a.Id) == DbSong.Normalize(b.Id);
-        return DbSong.Normalize(a.Title) == DbSong.Normalize(b.Title)
+        return a.SharesTitleIdentity(b)
             && (string.IsNullOrWhiteSpace(a.Artist) || string.IsNullOrWhiteSpace(b.Artist)
-                || DbSong.Normalize(a.Artist) == DbSong.Normalize(b.Artist));
+                || a.MatchesArtist(b.Artist) || b.MatchesArtist(a.Artist));
     }
 
     private void ExportMerged()

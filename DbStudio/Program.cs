@@ -17,6 +17,7 @@ internal static class Program
         {
             if (args.Any(a => string.Equals(a, "--smoke-test", StringComparison.OrdinalIgnoreCase)))
             {
+                JsonAdapters.SelfTest();
                 using var form = new MainForm();
                 // Force handle creation too, so title-bar and control initialization
                 // are covered without entering a permanent GUI message loop in CI.
