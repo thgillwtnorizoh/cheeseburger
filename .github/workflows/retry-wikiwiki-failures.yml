@@ -13,15 +13,16 @@ permissions:
   actions: read
 
 env:
-  # First retry round starts from the throttled full crawl. For a later round,
-  # point this at the previous retry run so only its remaining failure queue is used.
+  # This round restarts from the original throttled crawl because the manually
+  # cancelled retry run never reached artifact upload. The worker checkpoints
+  # after every URL now, so future rounds can point at the latest retry artifact.
   SOURCE_RUN_ID: "33283596278"
   SOURCE_ARTIFACT_NAME: "wikiwiki-jp-fetch"
 
 jobs:
   retry-failed-pages:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -81,18 +82,21 @@ jobs:
             --summary-output build/wikiwiki-jp-summary.json \
             --remaining-output build/wikiwiki-jp-retry-remaining.json \
             --source-run-id "${SOURCE_RUN_ID}" \
-            --delay 2.5 \
-            --jitter 1.5 \
+            --initial-cooldown 60 \
+            --delay 8 \
+            --jitter 4 \
             --timeout 25 \
             --attempts 2 \
-            --rate-backoff 20 \
-            --rate-backoff-cap 120 \
-            --circuit-breaker 3 \
             --cooldown 180 \
-            --cooldown-jitter 30
+            --cooldown-jitter 60
 
       - name: Publish retry summary
+        if: ${{ always() }}
         run: |
+          if [ ! -f build/wikiwiki-jp-summary.json ]; then
+            echo "No retry checkpoint summary exists yet."
+            exit 0
+          fi
           python - <<'PY'
           import json
           import os
@@ -114,15 +118,14 @@ jobs:
                       ("Duplicate requests avoided", "duplicate_failure_records_avoided_as_network_requests"),
                       ("URLs actually attempted", "network_urls_attempted"),
                       ("URLs recovered", "network_urls_succeeded"),
-                      ("URLs failed after retries", "network_urls_failed"),
-                      ("URLs deferred without request", "network_urls_deferred_without_request"),
+                      ("URLs failed/kept queued", "network_urls_failed"),
                       ("Failure records recovered", "failure_records_recovered"),
                       ("Failure records remaining", "failure_records_remaining"),
                       ("Unique URLs remaining", "unique_urls_remaining"),
                       ("Hibernations", "hibernations"),
                   ]:
                       f.write(f"| {label} | {retry.get(key, 0)} |\n")
-
+                  f.write(f"\nPersistent-429 stop: `{retry.get('stopped_after_persistent_429', False)}`\n")
                   f.write("\n| Cumulative metric | Count |\n|---|---:|\n")
                   for label, key in [
                       ("Target page records", "songs_pages_target_total"),
@@ -136,20 +139,12 @@ jobs:
                       ("Charts missing note counts", "charts_missing_note_counts"),
                   ]:
                       f.write(f"| {label} | {summary.get(key, 0)} |\n")
-
-                  failures = summary.get("fetch_failures", [])
-                  if failures:
-                      f.write("\n## Queue for the next retry job\n")
-                      for failure in failures[:100]:
-                          f.write(f"- `{failure.get('title')}`: {failure.get('error')}\n")
-                      if len(failures) > 100:
-                          f.write(f"- ...and {len(failures) - 100} more in the artifact manifest.\n")
           PY
 
       - name: Upload cumulative WikiWiki retry artifact
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          # Keep the same artifact name so the next retry round can consume it.
           name: wikiwiki-jp-fetch
           path: |
             build/wikiwiki-jp-songs.json
@@ -157,5 +152,5 @@ jobs:
             build/wikiwiki-jp-pages.json
             build/wikiwiki-jp-summary.json
             build/wikiwiki-jp-retry-remaining.json
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
