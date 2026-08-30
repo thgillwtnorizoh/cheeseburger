@@ -14,10 +14,9 @@ permissions:
   actions: read
 
 env:
-  # Continue from the latest checkpointed retry artifact. This preserves all
-  # 371 cumulative successes from the previous round and starts with only its
-  # remaining queue plus any genuinely new manual targets below.
-  SOURCE_RUN_ID: "33289422781"
+  # Continue from the latest checkpointed retry artifact. At this point only
+  # the final failed WikiWiki page should remain queued.
+  SOURCE_RUN_ID: "33306415702"
   SOURCE_ARTIFACT_NAME: "wikiwiki-jp-fetch"
 
 jobs:
