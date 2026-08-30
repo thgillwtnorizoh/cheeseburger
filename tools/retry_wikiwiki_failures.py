@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Retry only failed WikiWiki song-page fetches from a previous crawl artifact.
 
-This deliberately does not rediscover or recrawl successful pages. It consumes the
-previous artifact's validation.failures queue, deduplicates exact URLs for network
-requests, and leaves any new failures in the output queue for a later job.
+The worker never rediscoveries or recrawls pages that were already successful in the
+source artifact. Exact failed URLs are deduplicated for network requests, every result
+is checkpointed immediately, and anything not recovered remains queued for a later job.
 """
 
 from __future__ import annotations
@@ -26,22 +26,18 @@ import fetch_wikiwiki_pages as wiki
 
 
 class RateLimitedError(RuntimeError):
-    pass
+    def __init__(self, url: str, retry_after: float | None = None) -> None:
+        super().__init__(f"429 Too Many Requests for {url}")
+        self.url = url
+        self.retry_after = retry_after
 
 
 class RespectfulClient:
-    def __init__(
-        self,
-        *,
-        timeout: float,
-        attempts: int,
-        rate_backoff: float,
-        rate_backoff_cap: float,
-    ) -> None:
+    """Small sequential client. 429 responses are never retried immediately."""
+
+    def __init__(self, *, timeout: float, attempts: int) -> None:
         self.timeout = timeout
         self.attempts = max(1, attempts)
-        self.rate_backoff = max(1.0, rate_backoff)
-        self.rate_backoff_cap = max(self.rate_backoff, rate_backoff_cap)
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -51,7 +47,7 @@ class RespectfulClient:
         )
 
     @staticmethod
-    def _retry_after_seconds(value: str | None) -> float | None:
+    def retry_after_seconds(value: str | None) -> float | None:
         if not value:
             return None
         value = value.strip()
@@ -76,31 +72,22 @@ class RespectfulClient:
                 last = exc
                 if attempt + 1 >= self.attempts:
                     break
-                wait = min(20.0, 3.0 * (2**attempt)) + random.uniform(0.0, 2.0)
+                wait = min(30.0, 5.0 * (2**attempt)) + random.uniform(0.0, 3.0)
                 print(f"  network error: {exc}; retrying in {wait:.1f}s", flush=True)
                 time.sleep(wait)
                 continue
 
             if response.status_code == 429:
-                last = RateLimitedError(f"429 Too Many Requests for {url}")
-                if attempt + 1 >= self.attempts:
-                    raise last
-
-                server_wait = self._retry_after_seconds(response.headers.get("Retry-After"))
-                if server_wait is not None:
-                    wait = server_wait
-                    reason = "server Retry-After"
-                else:
-                    wait = min(self.rate_backoff_cap, self.rate_backoff * (2**attempt))
-                    wait += random.uniform(0.0, 5.0)
-                    reason = "exponential 429 backoff"
-                print(f"  429 throttle: sleeping {wait:.1f}s ({reason})", flush=True)
-                time.sleep(wait)
-                continue
+                # Deliberately do not retry this URL in-place. Leave it in the next
+                # queue and let the outer worker hibernate before one cautious probe.
+                raise RateLimitedError(
+                    url,
+                    self.retry_after_seconds(response.headers.get("Retry-After")),
+                )
 
             if 500 <= response.status_code < 600 and attempt + 1 < self.attempts:
                 last = RuntimeError(f"HTTP {response.status_code} for {url}")
-                wait = min(30.0, 5.0 * (2**attempt)) + random.uniform(0.0, 2.0)
+                wait = min(45.0, 8.0 * (2**attempt)) + random.uniform(0.0, 3.0)
                 print(f"  HTTP {response.status_code}: retrying in {wait:.1f}s", flush=True)
                 time.sleep(wait)
                 continue
@@ -129,7 +116,7 @@ def _load(path: Path) -> dict[str, Any]:
     return data
 
 
-def _group_failures(failures: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+def _group_failures(failures: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     by_url: dict[str, list[dict[str, Any]]] = {}
     for item in failures:
         if not isinstance(item, dict):
@@ -144,7 +131,7 @@ def _group_failures(failures: list[dict[str, Any]]) -> list[tuple[str, list[dict
         normalized["title"] = title
         normalized["url"] = url
         by_url.setdefault(url, []).append(normalized)
-    return list(by_url.items())
+    return by_url
 
 
 def _failure_copy(item: dict[str, Any], error: str) -> dict[str, str]:
@@ -155,7 +142,9 @@ def _failure_copy(item: dict[str, Any], error: str) -> dict[str, str]:
     }
 
 
-def _record_for_failure(base_record: dict[str, Any], failure: dict[str, Any], source_run_id: str) -> dict[str, Any]:
+def _record_for_failure(
+    base_record: dict[str, Any], failure: dict[str, Any], source_run_id: str
+) -> dict[str, Any]:
     record = copy.deepcopy(base_record)
     meta = record.setdefault("_meta", {})
     meta["index_entry"] = {
@@ -170,10 +159,39 @@ def _record_for_failure(base_record: dict[str, Any], failure: dict[str, Any], so
     return record
 
 
-def _summarize(
-    data: dict[str, Any],
-    retry: dict[str, Any],
+def _flatten_pending(pending: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [item for group in pending.values() for item in group]
+
+
+def _build_result(
+    previous_validation: dict[str, Any],
+    songs: list[dict[str, Any]],
+    pending: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
+    remaining = _flatten_pending(pending)
+    invalid = [
+        record.get("song", {}).get("title")
+        for record in songs
+        if not record.get("_meta", {}).get("validation", {}).get("ok", False)
+    ]
+    invalid = [str(x) for x in invalid if x]
+    target_total = int(previous_validation.get("requested", len(songs) + len(remaining)))
+    return {
+        "source": "arcaea_wikiwiki_jp",
+        "fetched_at": wiki.utc_now(),
+        "validation": {
+            "ok": bool(songs) and not remaining and not invalid,
+            "requested": target_total,
+            "parsed": len(songs),
+            "failed": len(remaining),
+            "invalid": invalid,
+            "failures": remaining,
+        },
+        "songs": songs,
+    }
+
+
+def _summarize(data: dict[str, Any], retry: dict[str, Any]) -> dict[str, Any]:
     songs = data.get("songs", [])
     validation = data.get("validation", {})
     charts: list[tuple[str | None, str, dict[str, Any]]] = []
@@ -204,7 +222,11 @@ def _summarize(
             warnings.append({"title": str(title), "message": str(message)})
             warning_counts[str(message)] += 1
         for difficulty, chart in record.get("charts", {}).items():
-            if chart.get("level") is None and chart.get("constant") is None and chart.get("notes") is None:
+            if (
+                chart.get("level") is None
+                and chart.get("constant") is None
+                and chart.get("notes") is None
+            ):
                 continue
             charts.append((title, difficulty, chart))
 
@@ -231,201 +253,226 @@ def _summarize(
     }
 
 
-def retry_failures(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
-    previous = _load(args.previous)
-    previous_validation = previous["validation"]
-    previous_failures = [x for x in previous_validation.get("failures", []) if isinstance(x, dict)]
-    grouped = _group_failures(previous_failures)
-
-    client = RespectfulClient(
-        timeout=args.timeout,
-        attempts=args.attempts,
-        rate_backoff=args.rate_backoff,
-        rate_backoff_cap=args.rate_backoff_cap,
-    )
-
-    recovered_records: list[dict[str, Any]] = []
-    remaining_failures: list[dict[str, str]] = []
-    network_attempted = 0
-    network_succeeded = 0
-    network_failed = 0
-    deferred_urls = 0
-    recovered_failure_records = 0
-    consecutive_rate_limited_urls = 0
-    hibernations = 0
-    probing_after_hibernation = False
-    deferred_from_index: int | None = None
-
-    print(
-        f"Previous queue: {len(previous_failures)} failure record(s), "
-        f"{len(grouped)} unique URL(s)",
-        flush=True,
-    )
-
-    for index, (url, failure_group) in enumerate(grouped):
-        if deferred_from_index is not None:
-            break
-
-        title_text = " | ".join(x.get("title") or "(untitled)" for x in failure_group)
-        print(f"[{index + 1}/{len(grouped)}] Fetching {title_text}", flush=True)
-        network_attempted += 1
-        hibernated_this_iteration = False
-
-        try:
-            page_html = client.get(url)
-            base_record = wiki.parse_page(page_html, url, failure_group[0].get("title"))
-            for failure in failure_group:
-                recovered_records.append(_record_for_failure(base_record, failure, args.source_run_id))
-            recovered_failure_records += len(failure_group)
-            network_succeeded += 1
-            consecutive_rate_limited_urls = 0
-            probing_after_hibernation = False
-            print(f"  recovered {len(failure_group)} failure record(s)", flush=True)
-        except RateLimitedError as exc:
-            network_failed += 1
-            consecutive_rate_limited_urls += 1
-            for failure in failure_group:
-                remaining_failures.append(_failure_copy(failure, str(exc)))
-            print(
-                f"  still throttled ({consecutive_rate_limited_urls}/{args.circuit_breaker} consecutive URL failures)",
-                flush=True,
-            )
-
-            if consecutive_rate_limited_urls >= args.circuit_breaker:
-                if not probing_after_hibernation:
-                    wait = args.cooldown + random.uniform(0.0, args.cooldown_jitter)
-                    hibernations += 1
-                    probing_after_hibernation = True
-                    consecutive_rate_limited_urls = 0
-                    hibernated_this_iteration = True
-                    print(
-                        f"  hibernating for {wait:.1f}s before a cautious probe; no requests during cooldown",
-                        flush=True,
-                    )
-                    time.sleep(wait)
-                else:
-                    deferred_from_index = index + 1
-                    print(
-                        "  throttling persisted after hibernation; deferring every untouched URL to the next job",
-                        flush=True,
-                    )
-        except Exception as exc:
-            network_failed += 1
-            consecutive_rate_limited_urls = 0
-            for failure in failure_group:
-                remaining_failures.append(_failure_copy(failure, str(exc)))
-            print(f"  failed: {exc}", flush=True)
-
-        if index + 1 < len(grouped) and not hibernated_this_iteration and deferred_from_index is None:
-            wait = args.delay + random.uniform(0.0, args.jitter)
-            if wait > 0:
-                time.sleep(wait)
-
-    if deferred_from_index is not None:
-        untouched = grouped[deferred_from_index:]
-        deferred_urls = len(untouched)
-        for _url, failure_group in untouched:
-            for failure in failure_group:
-                remaining_failures.append(
-                    _failure_copy(
-                        failure,
-                        "Deferred without request after persistent 429 throttling; queued for next retry job",
-                    )
-                )
-
-    cumulative_songs = list(previous.get("songs", [])) + recovered_records
-    invalid = [
-        record.get("song", {}).get("title")
-        for record in cumulative_songs
-        if not record.get("_meta", {}).get("validation", {}).get("ok", False)
-    ]
-    invalid = [str(x) for x in invalid if x]
-
-    target_total = int(previous_validation.get("requested", len(cumulative_songs) + len(previous_failures)))
-    result = {
-        "source": "arcaea_wikiwiki_jp",
-        "fetched_at": wiki.utc_now(),
-        "validation": {
-            "ok": bool(cumulative_songs) and not remaining_failures and not invalid,
-            "requested": target_total,
-            "parsed": len(cumulative_songs),
-            "failed": len(remaining_failures),
-            "invalid": invalid,
-            "failures": remaining_failures,
-        },
-        "songs": cumulative_songs,
-    }
-
-    retry = {
-        "source_run_id": args.source_run_id or None,
-        "failure_records_queued": len(previous_failures),
-        "unique_urls_queued": len(grouped),
-        "duplicate_failure_records_avoided_as_network_requests": len(previous_failures) - len(grouped),
-        "network_urls_attempted": network_attempted,
-        "network_urls_succeeded": network_succeeded,
-        "network_urls_failed": network_failed,
-        "network_urls_deferred_without_request": deferred_urls,
-        "failure_records_recovered": recovered_failure_records,
-        "failure_records_remaining": len(remaining_failures),
-        "unique_urls_remaining": len({x.get("url") for x in remaining_failures if x.get("url")}),
-        "hibernations": hibernations,
-        "base_inter_request_delay_seconds": args.delay,
-        "inter_request_jitter_seconds": args.jitter,
-        "attempts_per_url": args.attempts,
-        "circuit_breaker_consecutive_429_urls": args.circuit_breaker,
-        "cooldown_seconds": args.cooldown,
-    }
-    return result, retry
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--previous", type=Path, required=True, help="Previous wikiwiki-jp-pages.json")
-    parser.add_argument("--output", type=Path, required=True, help="Cumulative output JSON")
-    parser.add_argument("--summary-output", type=Path, required=True)
-    parser.add_argument("--remaining-output", type=Path, required=True)
-    parser.add_argument("--source-run-id", default="")
-    parser.add_argument("--delay", type=float, default=2.5, help="Base delay between distinct page URLs")
-    parser.add_argument("--jitter", type=float, default=1.5, help="Additional random inter-request delay")
-    parser.add_argument("--timeout", type=float, default=25.0)
-    parser.add_argument("--attempts", type=int, default=2, help="Maximum request attempts per URL")
-    parser.add_argument("--rate-backoff", type=float, default=20.0, help="Initial 429 backoff when Retry-After is absent")
-    parser.add_argument("--rate-backoff-cap", type=float, default=120.0)
-    parser.add_argument("--circuit-breaker", type=int, default=3, help="Consecutive rate-limited URLs before hibernation")
-    parser.add_argument("--cooldown", type=float, default=180.0, help="Hibernation after sustained throttling")
-    parser.add_argument("--cooldown-jitter", type=float, default=30.0)
-    args = parser.parse_args()
-
-    if args.circuit_breaker < 1:
-        parser.error("--circuit-breaker must be at least 1")
-    if args.delay < 0 or args.jitter < 0 or args.cooldown < 0 or args.cooldown_jitter < 0:
-        parser.error("delay/cooldown values cannot be negative")
-
-    result, retry = retry_failures(args)
+def _write_checkpoint(
+    args: argparse.Namespace,
+    result: dict[str, Any],
+    retry: dict[str, Any],
+) -> dict[str, Any]:
     summary = _summarize(result, retry)
-
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    args.summary_output.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    args.output.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    args.summary_output.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    failures = result["validation"]["failures"]
     args.remaining_output.write_text(
         json.dumps(
             {
                 "source": "arcaea_wikiwiki_jp",
                 "generated_at": wiki.utc_now(),
                 "source_run_id": args.source_run_id or None,
-                "remaining_count": len(result["validation"]["failures"]),
-                "remaining_unique_urls": len({
-                    x.get("url") for x in result["validation"]["failures"] if x.get("url")
-                }),
-                "failures": result["validation"]["failures"],
+                "remaining_count": len(failures),
+                "remaining_unique_urls": len(
+                    {x.get("url") for x in failures if x.get("url")}
+                ),
+                "failures": failures,
             },
             ensure_ascii=False,
             indent=2,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
+    return summary
 
+
+def retry_failures(args: argparse.Namespace) -> dict[str, Any]:
+    previous = _load(args.previous)
+    previous_validation = previous["validation"]
+    previous_failures = [
+        x for x in previous_validation.get("failures", []) if isinstance(x, dict)
+    ]
+    grouped = _group_failures(previous_failures)
+    ordered = list(grouped.items())
+    pending: dict[str, list[dict[str, Any]]] = copy.deepcopy(grouped)
+    songs: list[dict[str, Any]] = copy.deepcopy(previous.get("songs", []))
+
+    client = RespectfulClient(timeout=args.timeout, attempts=args.attempts)
+
+    network_attempted = 0
+    network_succeeded = 0
+    network_failed = 0
+    recovered_failure_records = 0
+    hibernations = 0
+    probing_after_hibernation = False
+    stopped_after_persistent_429 = False
+
+    def retry_meta() -> dict[str, Any]:
+        remaining = _flatten_pending(pending)
+        return {
+            "source_run_id": args.source_run_id or None,
+            "failure_records_queued": len(previous_failures),
+            "unique_urls_queued": len(grouped),
+            "duplicate_failure_records_avoided_as_network_requests": len(previous_failures)
+            - len(grouped),
+            "network_urls_attempted": network_attempted,
+            "network_urls_succeeded": network_succeeded,
+            "network_urls_failed": network_failed,
+            "failure_records_recovered": recovered_failure_records,
+            "failure_records_remaining": len(remaining),
+            "unique_urls_remaining": len(pending),
+            "hibernations": hibernations,
+            "stopped_after_persistent_429": stopped_after_persistent_429,
+            "initial_cooldown_seconds": args.initial_cooldown,
+            "base_inter_request_delay_seconds": args.delay,
+            "inter_request_jitter_seconds": args.jitter,
+            "network_attempts_per_url": args.attempts,
+            "cooldown_seconds": args.cooldown,
+            "cooldown_jitter_seconds": args.cooldown_jitter,
+            "checkpoint_after_every_url": True,
+        }
+
+    def checkpoint() -> dict[str, Any]:
+        result = _build_result(previous_validation, songs, pending)
+        return _write_checkpoint(args, result, retry_meta())
+
+    print(
+        f"Previous queue: {len(previous_failures)} failure record(s), "
+        f"{len(grouped)} unique URL(s)",
+        flush=True,
+    )
+    checkpoint()
+
+    if args.initial_cooldown > 0 and ordered:
+        print(
+            f"Initial courtesy cooldown: {args.initial_cooldown:.1f}s before first request",
+            flush=True,
+        )
+        time.sleep(args.initial_cooldown)
+
+    for index, (url, failure_group) in enumerate(ordered):
+        # A URL can disappear only after a successful checkpoint.
+        if url not in pending:
+            continue
+
+        title_text = " | ".join(
+            str(x.get("title") or "(untitled)") for x in failure_group
+        )
+        print(f"[{index + 1}/{len(ordered)}] Fetching {title_text}", flush=True)
+        network_attempted += 1
+
+        try:
+            page_html = client.get(url)
+            base_record = wiki.parse_page(page_html, url, failure_group[0].get("title"))
+            for failure in failure_group:
+                songs.append(
+                    _record_for_failure(base_record, failure, args.source_run_id)
+                )
+            recovered_failure_records += len(failure_group)
+            network_succeeded += 1
+            pending.pop(url, None)
+            probing_after_hibernation = False
+            print(f"  recovered {len(failure_group)} failure record(s)", flush=True)
+            checkpoint()
+
+            if index + 1 < len(ordered):
+                wait = args.delay + random.uniform(0.0, args.jitter)
+                if wait > 0:
+                    print(f"  courtesy spacing: {wait:.1f}s", flush=True)
+                    time.sleep(wait)
+
+        except RateLimitedError as exc:
+            network_failed += 1
+            pending[url] = [_failure_copy(item, str(exc)) for item in failure_group]
+            checkpoint()
+
+            if probing_after_hibernation:
+                stopped_after_persistent_429 = True
+                print(
+                    "  probe after hibernation also received 429; stopping now and "
+                    "leaving this plus every untouched URL for the next job",
+                    flush=True,
+                )
+                checkpoint()
+                break
+
+            server_wait = exc.retry_after or 0.0
+            wait = max(args.cooldown, server_wait) + random.uniform(
+                0.0, args.cooldown_jitter
+            )
+            hibernations += 1
+            probing_after_hibernation = True
+            print(
+                f"  429 throttle: hibernating {wait:.1f}s before one cautious probe; "
+                "this URL remains queued for next job",
+                flush=True,
+            )
+            checkpoint()
+            time.sleep(wait)
+
+        except Exception as exc:
+            network_failed += 1
+            pending[url] = [_failure_copy(item, str(exc)) for item in failure_group]
+            probing_after_hibernation = False
+            print(f"  failed: {exc}; keeping URL in next queue", flush=True)
+            checkpoint()
+
+            if index + 1 < len(ordered):
+                wait = args.delay + random.uniform(0.0, args.jitter)
+                if wait > 0:
+                    time.sleep(wait)
+
+    result = _build_result(previous_validation, songs, pending)
+    summary = _write_checkpoint(args, result, retry_meta())
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--previous", type=Path, required=True, help="Previous wikiwiki-jp-pages.json"
+    )
+    parser.add_argument("--output", type=Path, required=True, help="Cumulative output JSON")
+    parser.add_argument("--summary-output", type=Path, required=True)
+    parser.add_argument("--remaining-output", type=Path, required=True)
+    parser.add_argument("--source-run-id", default="")
+    parser.add_argument(
+        "--initial-cooldown", type=float, default=60.0, help="Quiet period before the first request"
+    )
+    parser.add_argument(
+        "--delay", type=float, default=8.0, help="Base delay between distinct page URLs"
+    )
+    parser.add_argument(
+        "--jitter", type=float, default=4.0, help="Additional random inter-request delay"
+    )
+    parser.add_argument("--timeout", type=float, default=25.0)
+    parser.add_argument(
+        "--attempts", type=int, default=2, help="Attempts for network/5xx errors; 429 is never retried in-place"
+    )
+    parser.add_argument(
+        "--cooldown", type=float, default=180.0, help="Minimum hibernation after the first 429"
+    )
+    parser.add_argument("--cooldown-jitter", type=float, default=60.0)
+    args = parser.parse_args()
+
+    if args.attempts < 1:
+        parser.error("--attempts must be at least 1")
+    if any(
+        value < 0
+        for value in (
+            args.initial_cooldown,
+            args.delay,
+            args.jitter,
+            args.cooldown,
+            args.cooldown_jitter,
+        )
+    ):
+        parser.error("delay/cooldown values cannot be negative")
+
+    retry_failures(args)
     return 0
 
 
