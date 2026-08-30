@@ -1,0 +1,161 @@
+name: Retry failed Arcaea WikiWiki pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/retry_wikiwiki_failures.py"
+      - ".github/workflows/retry-wikiwiki-failures.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # First retry round starts from the throttled full crawl. For a later round,
+  # point this at the previous retry run so only its remaining failure queue is used.
+  SOURCE_RUN_ID: "33283596278"
+  SOURCE_ARTIFACT_NAME: "wikiwiki-jp-fetch"
+
+jobs:
+  retry-failed-pages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-fetch.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-fetch.txt
+
+      - name: Validate retry worker
+        run: |
+          python -m py_compile tools/fetch_wikiwiki_pages.py
+          python -m py_compile tools/retry_wikiwiki_failures.py
+
+      - name: Download previous crawl artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p build/previous
+          echo "Retry source run: ${SOURCE_RUN_ID}"
+          gh run download "${SOURCE_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "${SOURCE_ARTIFACT_NAME}" \
+            --dir build/previous
+          test -f build/previous/wikiwiki-jp-pages.json
+
+          # Carry discovery/sample files forward without touching WikiWiki again.
+          if [ -f build/previous/wikiwiki-jp-songs.json ]; then
+            cp build/previous/wikiwiki-jp-songs.json build/wikiwiki-jp-songs.json
+          fi
+          if [ -f build/previous/wikiwiki-jp-page-samples.json ]; then
+            cp build/previous/wikiwiki-jp-page-samples.json build/wikiwiki-jp-page-samples.json
+          fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("build/previous/wikiwiki-jp-pages.json")
+          data = json.loads(p.read_text(encoding="utf-8"))
+          failures = data.get("validation", {}).get("failures", [])
+          urls = {x.get("url") for x in failures if isinstance(x, dict) and x.get("url")}
+          print(f"Loaded {len(failures)} failure record(s), {len(urls)} unique URL(s).")
+          print("No successful page from the source artifact will be requested again.")
+          PY
+
+      - name: Retry only failed WikiWiki pages
+        run: |
+          python tools/retry_wikiwiki_failures.py \
+            --previous build/previous/wikiwiki-jp-pages.json \
+            --output build/wikiwiki-jp-pages.json \
+            --summary-output build/wikiwiki-jp-summary.json \
+            --remaining-output build/wikiwiki-jp-retry-remaining.json \
+            --source-run-id "${SOURCE_RUN_ID}" \
+            --delay 2.5 \
+            --jitter 1.5 \
+            --timeout 25 \
+            --attempts 2 \
+            --rate-backoff 20 \
+            --rate-backoff-cap 120 \
+            --circuit-breaker 3 \
+            --cooldown 180 \
+            --cooldown-jitter 30
+
+      - name: Publish retry summary
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          summary = json.loads(Path("build/wikiwiki-jp-summary.json").read_text(encoding="utf-8"))
+          retry = summary["retry"]
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as f:
+                  f.write("# WikiWiki JP failed-page retry\n\n")
+                  f.write(f"Source run: `{retry.get('source_run_id')}`\n\n")
+                  f.write("| Retry metric | Count |\n|---|---:|\n")
+                  for label, key in [
+                      ("Failure records queued", "failure_records_queued"),
+                      ("Unique URLs queued", "unique_urls_queued"),
+                      ("Duplicate requests avoided", "duplicate_failure_records_avoided_as_network_requests"),
+                      ("URLs actually attempted", "network_urls_attempted"),
+                      ("URLs recovered", "network_urls_succeeded"),
+                      ("URLs failed after retries", "network_urls_failed"),
+                      ("URLs deferred without request", "network_urls_deferred_without_request"),
+                      ("Failure records recovered", "failure_records_recovered"),
+                      ("Failure records remaining", "failure_records_remaining"),
+                      ("Unique URLs remaining", "unique_urls_remaining"),
+                      ("Hibernations", "hibernations"),
+                  ]:
+                      f.write(f"| {label} | {retry.get(key, 0)} |\n")
+
+                  f.write("\n| Cumulative metric | Count |\n|---|---:|\n")
+                  for label, key in [
+                      ("Target page records", "songs_pages_target_total"),
+                      ("Fetched page records", "pages_fetched_cumulative"),
+                      ("Failures remaining", "pages_failed_remaining"),
+                      ("Invalid pages", "invalid_pages"),
+                      ("Charts parsed", "charts_parsed"),
+                      ("Charts with CC", "charts_with_cc"),
+                      ("Charts missing CC", "charts_missing_cc"),
+                      ("Charts with note counts", "charts_with_note_counts"),
+                      ("Charts missing note counts", "charts_missing_note_counts"),
+                  ]:
+                      f.write(f"| {label} | {summary.get(key, 0)} |\n")
+
+                  failures = summary.get("fetch_failures", [])
+                  if failures:
+                      f.write("\n## Queue for the next retry job\n")
+                      for failure in failures[:100]:
+                          f.write(f"- `{failure.get('title')}`: {failure.get('error')}\n")
+                      if len(failures) > 100:
+                          f.write(f"- ...and {len(failures) - 100} more in the artifact manifest.\n")
+          PY
+
+      - name: Upload cumulative WikiWiki retry artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Keep the same artifact name so the next retry round can consume it.
+          name: wikiwiki-jp-fetch
+          path: |
+            build/wikiwiki-jp-songs.json
+            build/wikiwiki-jp-page-samples.json
+            build/wikiwiki-jp-pages.json
+            build/wikiwiki-jp-summary.json
+            build/wikiwiki-jp-retry-remaining.json
+          if-no-files-found: error
+          retention-days: 14
