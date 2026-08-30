@@ -1,4 +1,4 @@
-name: Validate Arcaea wiki fetch
+name: Fetch Arcaea WikiWiki data
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ permissions:
 jobs:
   fetch-wikiwiki:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -129,7 +129,121 @@ jobs:
           print("all page assertions passed")
           PY
 
-      - name: Upload fetch diagnostics
+      - name: Fetch all Japanese WikiWiki song pages
+        run: |
+          python tools/fetch_wikiwiki_pages.py \
+            --index build/wikiwiki-jp-songs.json \
+            --all \
+            --delay 0.15 \
+            --timeout 25 \
+            --retries 3 \
+            --output build/wikiwiki-jp-pages.json
+
+      - name: Summarize full crawl coverage
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from collections import Counter
+          from pathlib import Path
+
+          path = Path("build/wikiwiki-jp-pages.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          validation = data.get("validation", {})
+          songs = data.get("songs", [])
+
+          charts = []
+          errors = []
+          warnings = []
+          warning_counts = Counter()
+          error_counts = Counter()
+          suspicious = []
+
+          for record in songs:
+              title = record.get("song", {}).get("title")
+              meta = record.get("_meta", {})
+              v = meta.get("validation", {})
+              rec_errors = list(v.get("errors", []))
+              rec_warnings = list(v.get("warnings", []))
+              if rec_errors or rec_warnings:
+                  suspicious.append({
+                      "title": title,
+                      "url": meta.get("source_url"),
+                      "errors": rec_errors,
+                      "warnings": rec_warnings,
+                  })
+              for item in rec_errors:
+                  errors.append({"title": title, "message": item})
+                  error_counts[item] += 1
+              for item in rec_warnings:
+                  warnings.append({"title": title, "message": item})
+                  warning_counts[item] += 1
+
+              for difficulty, chart in record.get("charts", {}).items():
+                  if chart.get("level") is None and chart.get("constant") is None and chart.get("notes") is None:
+                      continue
+                  charts.append((title, difficulty, chart))
+
+          charts_with_cc = sum(c.get("constant") is not None for _, _, c in charts)
+          charts_with_notes = sum(c.get("notes") is not None for _, _, c in charts)
+
+          summary = {
+              "songs_pages_attempted": validation.get("requested", 0),
+              "pages_fetched_successfully": validation.get("parsed", 0),
+              "pages_failed": validation.get("failed", 0),
+              "invalid_pages": len(validation.get("invalid", [])),
+              "charts_parsed": len(charts),
+              "charts_with_cc": charts_with_cc,
+              "charts_missing_cc": len(charts) - charts_with_cc,
+              "charts_with_note_counts": charts_with_notes,
+              "charts_missing_note_counts": len(charts) - charts_with_notes,
+              "validation_errors": len(errors),
+              "validation_warnings": len(warnings),
+              "fetch_failures": validation.get("failures", []),
+              "invalid_titles": validation.get("invalid", []),
+              "error_counts": dict(error_counts),
+              "warning_counts": dict(warning_counts),
+              "suspicious_pages": suspicious,
+          }
+
+          Path("build/wikiwiki-jp-summary.json").write_text(
+              json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as f:
+                  f.write("# WikiWiki JP full crawl\n\n")
+                  f.write("| Metric | Count |\n|---|---:|\n")
+                  for label, key in [
+                      ("Songs/pages attempted", "songs_pages_attempted"),
+                      ("Pages fetched successfully", "pages_fetched_successfully"),
+                      ("Pages failed", "pages_failed"),
+                      ("Invalid pages", "invalid_pages"),
+                      ("Charts parsed", "charts_parsed"),
+                      ("Charts with CC", "charts_with_cc"),
+                      ("Charts missing CC", "charts_missing_cc"),
+                      ("Charts with note counts", "charts_with_note_counts"),
+                      ("Charts missing note counts", "charts_missing_note_counts"),
+                      ("Validation errors", "validation_errors"),
+                      ("Validation warnings", "validation_warnings"),
+                  ]:
+                      f.write(f"| {label} | {summary[key]} |\n")
+                  if summary["fetch_failures"]:
+                      f.write("\n## Fetch failures\n")
+                      for failure in summary["fetch_failures"]:
+                          f.write(f"- `{failure.get('title')}`: {failure.get('error')}\n")
+                  if suspicious:
+                      f.write("\n## Suspicious parser results\n")
+                      for row in suspicious[:100]:
+                          details = "; ".join(row["errors"] + row["warnings"])
+                          f.write(f"- `{row['title']}`: {details}\n")
+          PY
+
+      - name: Upload WikiWiki full crawl
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -137,5 +251,7 @@ jobs:
           path: |
             build/wikiwiki-jp-songs.json
             build/wikiwiki-jp-page-samples.json
+            build/wikiwiki-jp-pages.json
+            build/wikiwiki-jp-summary.json
           if-no-files-found: warn
           retention-days: 14
