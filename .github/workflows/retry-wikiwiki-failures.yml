@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "tools/retry_wikiwiki_failures.py"
+      - "tools/extend_wikiwiki_retry_queue.py"
       - ".github/workflows/retry-wikiwiki-failures.yml"
 
 permissions:
@@ -13,16 +14,16 @@ permissions:
   actions: read
 
 env:
-  # This round restarts from the original throttled crawl because the manually
-  # cancelled retry run never reached artifact upload. The worker checkpoints
-  # after every URL now, so future rounds can point at the latest retry artifact.
-  SOURCE_RUN_ID: "33283596278"
+  # Continue from the latest checkpointed retry artifact. This preserves all
+  # 371 cumulative successes from the previous round and starts with only its
+  # remaining queue plus any genuinely new manual targets below.
+  SOURCE_RUN_ID: "33289422781"
   SOURCE_ARTIFACT_NAME: "wikiwiki-jp-fetch"
 
 jobs:
   retry-failed-pages:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
 
     steps:
       - name: Checkout
@@ -38,12 +39,13 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-fetch.txt
 
-      - name: Validate retry worker
+      - name: Validate retry workers
         run: |
           python -m py_compile tools/fetch_wikiwiki_pages.py
           python -m py_compile tools/retry_wikiwiki_failures.py
+          python -m py_compile tools/extend_wikiwiki_retry_queue.py
 
-      - name: Download previous crawl artifact
+      - name: Download previous retry artifact
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -68,22 +70,38 @@ jobs:
           from pathlib import Path
           p = Path("build/previous/wikiwiki-jp-pages.json")
           data = json.loads(p.read_text(encoding="utf-8"))
-          failures = data.get("validation", {}).get("failures", [])
+          validation = data.get("validation", {})
+          failures = validation.get("failures", [])
           urls = {x.get("url") for x in failures if isinstance(x, dict) and x.get("url")}
-          print(f"Loaded {len(failures)} failure record(s), {len(urls)} unique URL(s).")
+          print(f"Loaded {validation.get('parsed', len(data.get('songs', [])))} cumulative success record(s).")
+          print(f"Loaded {len(failures)} remaining failure record(s), {len(urls)} unique URL(s).")
           print("No successful page from the source artifact will be requested again.")
           PY
 
-      - name: Retry only failed WikiWiki pages
+      - name: Prepend explicit new WikiWiki songs
+        run: |
+          python tools/extend_wikiwiki_retry_queue.py \
+            --input build/previous/wikiwiki-jp-pages.json \
+            --output build/previous/wikiwiki-jp-pages-next.json \
+            --url "https://wikiwiki.jp/arcaea/DIE%20IN#:hl:word=DIE%20IN" \
+            --url "https://wikiwiki.jp/arcaea/Balor#:hl:word=Balor" \
+            --url "https://wikiwiki.jp/arcaea/DREAD%20AREA#:hl:word=DREAD%20AREA" \
+            --url "https://wikiwiki.jp/arcaea/Riven%20Pilgrimage#:hl:word=Riven%20Pilgrimage" \
+            --url "https://wikiwiki.jp/arcaea/un#:hl:word=UN" \
+            --url "https://wikiwiki.jp/arcaea/Cataclysm%20Cry#:hl:word=Cataclysm%20Cry" \
+            --url "https://wikiwiki.jp/arcaea/DEINOS%20PHAINEIN#:hl:word=Deinos%20Phainein" \
+            --url "https://wikiwiki.jp/arcaea/Ember#:hl:word=Ember"
+
+      - name: Retry only remaining and explicit WikiWiki pages
         run: |
           python tools/retry_wikiwiki_failures.py \
-            --previous build/previous/wikiwiki-jp-pages.json \
+            --previous build/previous/wikiwiki-jp-pages-next.json \
             --output build/wikiwiki-jp-pages.json \
             --summary-output build/wikiwiki-jp-summary.json \
             --remaining-output build/wikiwiki-jp-retry-remaining.json \
             --source-run-id "${SOURCE_RUN_ID}" \
             --initial-cooldown 60 \
-            --delay 8 \
+            --delay 10 \
             --jitter 4 \
             --timeout 25 \
             --attempts 2 \
