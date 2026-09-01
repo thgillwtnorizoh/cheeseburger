@@ -83,7 +83,7 @@ internal static class JsonAdapters
                     VariantTitle = Str(c, "variant_title"),
                     VariantArtist = Str(c, "variant_artist"),
                     VariantBpm = Scalar(c["variant_bpm"]),
-                    VariantAddedVersion = Str(c["variant_added_version"]),
+                    VariantAddedVersion = Str(c, "variant_added_version"),
                     Background = Str(c, "background"),
                     ReleaseDate = Scalar(c["release_date"]),
                     AudioOverride = Boolean(c["audio_override"]),
