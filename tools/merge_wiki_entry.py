@@ -226,14 +226,25 @@ def validate_entry(entry: dict[str, Any]) -> list[str]:
 
 def entry_identity(entry: dict[str, Any]) -> tuple[str, ...]:
     source = normalized_text(entry.get("source"))
-    meta = entry.get("_meta") if isinstance(entry.get("_meta"), dict) else {}
-    source_url = normalized_url(meta.get("source_url"))
-    if source_url:
-        return ("url", source, source_url)
-
-    song = entry.get("song", {})
+    song = entry.get("song", {}) if isinstance(entry.get("song"), dict) else {}
+    song_id = normalized_text(song.get("id"))
     title = normalized_text(song.get("title"))
     artist = normalized_text(song.get("artist"))
+    meta = entry.get("_meta") if isinstance(entry.get("_meta"), dict) else {}
+    source_url = normalized_url(meta.get("source_url"))
+
+    # A single WikiWiki page can expose more than one semantic song/chart entry.
+    # Last is the canonical example: Last | Moment and Last | Eternity share one
+    # source URL. Keep page provenance in the identity, but disambiguate by the
+    # official ID when available or by the page entry's song title otherwise.
+    if source_url:
+        if song_id:
+            return ("url-id", source, source_url, song_id)
+        return ("url-title", source, source_url, title)
+
+    if song_id:
+        return ("song-id", source, song_id)
+
     # Title alone is not safe in Arcaea (e.g. collaboration duplicate names).
     return ("song", source, title, artist)
 
@@ -573,6 +584,18 @@ def self_test() -> int:
     new["_meta"]["source_url"] = "https://wikiwiki.jp/arcaea/OTHER"
     merged, stats = merge_entries([base], [new], compare_meta=False)
     assert stats["new"] == 1 and len(merged) == 2
+
+    same_page_variant = copy.deepcopy(base)
+    same_page_variant["song"]["title"] = "TEST | ALT"
+    same_page_variant["charts"] = {"BYD": {"level": "10+", "constant": 10.7, "notes": 1200}}
+    merged, stats = merge_entries([base], [same_page_variant], compare_meta=False)
+    assert stats["new"] == 1 and len(merged) == 2
+    assert entry_identity(base) != entry_identity(same_page_variant)
+
+    same_page_artist_update = copy.deepcopy(base)
+    same_page_artist_update["song"]["artist"] = "B"
+    merged, stats = merge_entries([base], [same_page_artist_update], compare_meta=False)
+    assert stats["updated"] == 1 and len(merged) == 1
 
     collection = new_collection([base])
     assert collection["format"] == FORMAT_V2
