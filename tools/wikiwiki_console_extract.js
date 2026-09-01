@@ -2,11 +2,14 @@
   "use strict";
 
   // Paste this whole file into DevTools Console while viewing a song page on
-  // https://wikiwiki.jp/arcaea/ . It prints normalized JSON and copies it to
-  // the clipboard when the console/browser allows it.
+  // https://wikiwiki.jp/arcaea/ . It prints tracker database schema-v2 JSON and
+  // copies it to the clipboard when the console/browser allows it.
 
   const SOURCE = "arcaea_wikiwiki_jp";
-  const PARSER_VERSION = "0.1.0";
+  const SOURCE_FORMAT = "wikiwiki_console_extract";
+  const FORMAT = "arcaea_tracker_database";
+  const SCHEMA_VERSION = 2;
+  const PARSER_VERSION = "0.2.0";
   const DIFF_NAMES = new Map([
     ["past", "PST"], ["pst", "PST"],
     ["present", "PRS"], ["prs", "PRS"],
@@ -34,6 +37,25 @@
     return null;
   };
 
+  const classificationFromDifficulty = (difficulty) => {
+    switch (difficulty) {
+      case "PST":
+        return { ratingClass: 0, ratingClassAlias: null, bydType: null, source: "inferred-semantic" };
+      case "PRS":
+        return { ratingClass: 1, ratingClassAlias: null, bydType: null, source: "inferred-semantic" };
+      case "FTR":
+        return { ratingClass: 2, ratingClassAlias: null, bydType: null, source: "inferred-semantic" };
+      case "BYD":
+        return { ratingClass: 3, ratingClassAlias: null, bydType: 0, source: "inferred-semantic" };
+      case "ETR":
+        return { ratingClass: 4, ratingClassAlias: null, bydType: null, source: "inferred-semantic" };
+      case "INS":
+        return { ratingClass: 3, ratingClassAlias: 1, bydType: 1, source: "inferred-semantic" };
+      default:
+        return null;
+    }
+  };
+
   const parseLevel = (value) => {
     const m = clean(value).match(/(?:^|\s)(\?|\d{1,2}\+?)(?:\s|$)/);
     return m ? m[1] : null;
@@ -44,11 +66,12 @@
     return m ? Number(m[1]) : null;
   };
 
-  const blankChart = () => ({
+  const blankChart = (difficulty) => ({
     level: null,
     constant: null,
     notes: null,
     chart_designer: null,
+    classification: classificationFromDifficulty(difficulty),
   });
 
   const rowCells = (tr) => Array.from(tr.children)
@@ -163,7 +186,7 @@
   };
 
   const { table, diffs } = findChartTable();
-  const charts = Object.fromEntries(diffs.map((d) => [d, blankChart()]));
+  const charts = Object.fromEntries(diffs.map((d) => [d, blankChart(d)]));
 
   let artist = null;
   let pack = null;
@@ -237,11 +260,11 @@
   }
 
   for (const [d, value] of Object.entries(parseConstants())) {
-    charts[d] ||= blankChart();
+    charts[d] ||= blankChart(d);
     charts[d].constant = value;
   }
   for (const [d, value] of Object.entries(designers)) {
-    charts[d] ||= blankChart();
+    charts[d] ||= blankChart(d);
     charts[d].chart_designer = value;
   }
 
@@ -303,7 +326,8 @@
     .filter(([, c]) => c.level && c.notes == null)
     .map(([d]) => d);
 
-  const result = {
+  const fetchedAt = new Date().toISOString();
+  const entry = {
     source: SOURCE,
     song: {
       title,
@@ -318,7 +342,7 @@
     charts,
     _meta: {
       source_url: location.href.split("#")[0],
-      fetched_at: new Date().toISOString(),
+      fetched_at: fetchedAt,
       source_updated_at: sourceUpdatedAt(),
       parser_version: PARSER_VERSION,
       artwork_credit: artworkCredit,
@@ -332,6 +356,14 @@
     },
   };
 
+  const result = {
+    format: FORMAT,
+    schema_version: SCHEMA_VERSION,
+    source_format: SOURCE_FORMAT,
+    updated_at: fetchedAt,
+    entries: [entry],
+  };
+
   const json = JSON.stringify(result, null, 2);
   console.log(result);
   console.log(json);
@@ -341,10 +373,10 @@
   try {
     if (typeof copy === "function") {
       copy(json);
-      console.info("[Arcaea DB] JSON copied to clipboard.");
+      console.info("[Arcaea DB] Schema-v2 JSON copied to clipboard.");
     } else if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(json)
-        .then(() => console.info("[Arcaea DB] JSON copied to clipboard."))
+        .then(() => console.info("[Arcaea DB] Schema-v2 JSON copied to clipboard."))
         .catch(() => console.info("[Arcaea DB] Could not copy automatically; use the printed JSON."));
     }
   } catch (_) {
