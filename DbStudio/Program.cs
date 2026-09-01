@@ -17,6 +17,7 @@ internal static class Program
         {
             if (args.Any(a => string.Equals(a, "--smoke-test", StringComparison.OrdinalIgnoreCase)))
             {
+                DbSong.IdentityNormalizationSelfTest();
                 JsonAdapters.SelfTest();
                 using var form = CreateMainForm();
                 // Force handle creation too, so title-bar and control initialization
