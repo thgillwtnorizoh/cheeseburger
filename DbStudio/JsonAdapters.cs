@@ -135,6 +135,12 @@ internal static class JsonAdapters
                     _ => $"RC{ratingClass}"
                 };
                 var rating = Integer(node["rating"]);
+
+                // rating=0 is used by songlist for non-playable placeholder slots,
+                // such as Last | Eternity's PST/PRS/FTR entries. Do not turn those
+                // placeholders into real level-0 charts in the merged database.
+                if (rating == 0) continue;
+
                 var plus = node["ratingPlus"]?.GetValue<bool?>() == true;
                 var chart = new ChartInfo
                 {
@@ -185,22 +191,38 @@ internal static class JsonAdapters
 
     private static DbSong? FindTarget(List<DbSong> existing, DbSong incoming)
     {
-        if (!string.IsNullOrWhiteSpace(incoming.Id))
+        var incomingHasOfficialId = !string.IsNullOrWhiteSpace(incoming.Id);
+        var incomingId = DbSong.Normalize(incoming.Id);
+        if (incomingHasOfficialId)
         {
-            var byId = existing.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.Id) && DbSong.Normalize(x.Id) == DbSong.Normalize(incoming.Id));
+            var byId = existing.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x.Id) && DbSong.Normalize(x.Id) == incomingId);
             if (byId is not null) return byId;
         }
+
+        // Once both records have different official song IDs they are distinct,
+        // even if a variant title/alias happens to overlap. Official IDs outrank
+        // every heuristic identity signal.
+        var candidates = incomingHasOfficialId
+            ? existing.Where(x => string.IsNullOrWhiteSpace(x.Id) || DbSong.Normalize(x.Id) == incomingId).ToList()
+            : existing;
+
         if (!string.IsNullOrWhiteSpace(incoming.SourceUrl))
         {
-            var byUrl = existing.FirstOrDefault(x => string.Equals(x.SourceUrl, incoming.SourceUrl, StringComparison.OrdinalIgnoreCase));
-            if (byUrl is not null) return byUrl;
+            // One WikiWiki page may now yield multiple semantic entries (for
+            // example Last and Last | Eternity). URL alone is therefore not a
+            // sufficient identity key; require title identity as well.
+            var byUrl = candidates
+                .Where(x => string.Equals(x.SourceUrl, incoming.SourceUrl, StringComparison.OrdinalIgnoreCase))
+                .Where(x => x.SharesTitleIdentity(incoming))
+                .ToList();
+            if (byUrl.Count == 1) return byUrl[0];
         }
 
         // Identity matching is localization-aware in both directions. This lets
         // songlist "Hikari" (alias 光) match a WikiWiki entry titled 光, even if
         // either source was loaded first. Difficulty-localized titles such as
         // Axium Divergence are also considered, but remain chart-scoped metadata.
-        var titleMatches = existing.Where(x => x.SharesTitleIdentity(incoming)).ToList();
+        var titleMatches = candidates.Where(x => x.SharesTitleIdentity(incoming)).ToList();
         if (titleMatches.Count == 1) return titleMatches[0];
         if (!string.IsNullOrWhiteSpace(incoming.Artist))
         {
@@ -444,6 +466,86 @@ internal static class JsonAdapters
         var inscribed = ParseSonglistSong(inscribedObj, "songlist");
         if (!inscribed.Charts.TryGetValue("INS", out var ins) || ins.RatingClass != 3 || ins.RatingClassAlias != 1 || ins.BydType != 1)
             throw new InvalidDataException("Inscribed classification self-test failed.");
+
+        var lastObj = JsonNode.Parse("""
+        {
+          "id":"last",
+          "title_localized":{"en":"Last"},
+          "artist":"onoken",
+          "difficulties":[
+            {"ratingClass":0,"rating":4},
+            {"ratingClass":1,"rating":7},
+            {"ratingClass":2,"rating":9},
+            {"ratingClass":3,"rating":9,"title_localized":{"en":"Last | Moment"},"audioOverride":true,"jacketOverride":true}
+          ]
+        }
+        """)!.AsObject();
+        var eternityObj = JsonNode.Parse("""
+        {
+          "id":"lasteternity",
+          "title_localized":{"en":"Last | Eternity"},
+          "artist":"onoken",
+          "difficulties":[
+            {"ratingClass":0,"rating":0},
+            {"ratingClass":1,"rating":0},
+            {"ratingClass":2,"rating":0},
+            {"ratingClass":3,"rating":9,"ratingPlus":true}
+          ]
+        }
+        """)!.AsObject();
+        var last = ParseSonglistSong(lastObj, "songlist");
+        var eternity = ParseSonglistSong(eternityObj, "songlist");
+        if (eternity.Charts.Count != 1 || !eternity.Charts.ContainsKey("BYD"))
+            throw new InvalidDataException("Songlist rating-0 placeholder charts were not removed.");
+
+        var wikiLast = ParseNormalizedEntry(JsonNode.Parse("""
+        {
+          "source":"arcaea_wikiwiki_jp",
+          "song":{"title":"Last","artist":"onoken"},
+          "charts":{"BYD":{"level":"9","constant":9.6,"notes":888,"variant_title":"Last | Moment"}},
+          "_meta":{"source_url":"https://wikiwiki.jp/arcaea/Last"}
+        }
+        """)!.AsObject(), "wiki");
+        var wikiEternity = ParseNormalizedEntry(JsonNode.Parse("""
+        {
+          "source":"arcaea_wikiwiki_jp",
+          "song":{"title":"Last | Eternity","artist":"onoken"},
+          "charts":{"BYD":{"level":"9+","constant":9.7,"notes":790}},
+          "_meta":{"source_url":"https://wikiwiki.jp/arcaea/Last"}
+        }
+        """)!.AsObject(), "wiki");
+
+        var wikiOnlySplit = Merge(new[]
+        {
+            new SourceDocument { Name = "wiki", Kind = "wiki", Songs = new() { wikiLast, wikiEternity } },
+        });
+        if (wikiOnlySplit.Count != 2)
+            throw new InvalidDataException("Same-page Wiki entries were merged by URL alone.");
+
+        var lastMerged = Merge(new[]
+        {
+            new SourceDocument { Name = "songlist", Kind = "songlist", Songs = new() { last, eternity } },
+            new SourceDocument { Name = "wiki", Kind = "wiki", Songs = new() { wikiLast, wikiEternity } },
+        });
+        if (lastMerged.Count != 2 || lastMerged.Count(x => x.Id == "last") != 1 || lastMerged.Count(x => x.Id == "lasteternity") != 1)
+            throw new InvalidDataException("Distinct official Last song IDs were fused together.");
+        if (lastMerged.Single(x => x.Id == "last").Charts["BYD"].Notes != 888)
+            throw new InvalidDataException("Last | Moment Wiki data did not merge into id:last.");
+        if (lastMerged.Single(x => x.Id == "lasteternity").Charts["BYD"].Notes != 790)
+            throw new InvalidDataException("Last | Eternity Wiki data did not merge into id:lasteternity.");
+
+        var sameTitleA = ParseSonglistSong(JsonNode.Parse("""
+        {"id":"official-a","title_localized":{"en":"Shared Title"},"artist":"A","difficulties":[{"ratingClass":2,"rating":9}]}
+        """)!.AsObject(), "songlist");
+        var sameTitleB = ParseSonglistSong(JsonNode.Parse("""
+        {"id":"official-b","title_localized":{"en":"Shared Title"},"artist":"A","difficulties":[{"ratingClass":2,"rating":9}]}
+        """)!.AsObject(), "songlist");
+        var distinctOfficialIds = Merge(new[]
+        {
+            new SourceDocument { Name = "songlist", Kind = "songlist", Songs = new() { sameTitleA, sameTitleB } },
+        });
+        if (distinctOfficialIds.Count != 2)
+            throw new InvalidDataException("Different official IDs merged through title heuristics.");
 
         var exported = BuildExportDocument(new[] { inscribed });
         if (exported["format"]?.GetValue<string>() != "arcaea_tracker_database" || exported["schema_version"]?.GetValue<int>() != 2)
