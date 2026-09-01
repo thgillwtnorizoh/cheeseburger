@@ -310,8 +310,48 @@ internal sealed class DbSong
     public static string Normalize(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return "";
-        return string.Join(' ', value.Normalize(NormalizationForm.FormKC)
+
+        // Identity normalization is intentionally stricter than display text.
+        // Wiki page titles can contain invisible format characters (notably U+200B),
+        // while Arcaea's songlist and WikiWiki can use visually equivalent wave
+        // dash code points. Neither difference should split one song into two rows.
+        var normalized = value.Normalize(NormalizationForm.FormKC);
+        var cleaned = new StringBuilder(normalized.Length);
+        foreach (var rune in normalized.EnumerateRunes())
+        {
+            if (Rune.GetUnicodeCategory(rune) == UnicodeCategory.Format) continue;
+            if (rune.Value == 0x301C) // WAVE DASH; NFKC already maps FULLWIDTH TILDE to '~'.
+            {
+                cleaned.Append('~');
+                continue;
+            }
+            cleaned.Append(rune.ToString());
+        }
+
+        return string.Join(' ', cleaned.ToString()
             .Trim().ToLowerInvariant().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    public static void IdentityNormalizationSelfTest()
+    {
+        static void AssertSame(string left, string right, string label)
+        {
+            if (Normalize(left) != Normalize(right))
+                throw new InvalidDataException($"Unicode title identity self-test failed: {label}");
+        }
+
+        AssertSame(
+            "キャラメルポップコーンたべたいよ〜",
+            "キャラメルポップコーンたべたいよ～",
+            "Gimme Caramel Popcorn wave dash");
+        AssertSame(
+            "LIVHT MY WΔY",
+            "LIVHT MY W\u200BΔ\u200BY",
+            "LIVHT MY WAY zero-width spaces");
+        AssertSame(
+            "患部で止まってすぐ溶ける　〜 狂気の優曇華院",
+            "患部で止まってすぐ溶ける ～ 狂気の優曇華院",
+            "Kanbu wave dash/full-width space");
     }
 }
 
