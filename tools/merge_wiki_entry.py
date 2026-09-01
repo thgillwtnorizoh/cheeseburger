@@ -21,8 +21,14 @@ Supported input/target shapes:
 - {"entries": [...]} collections
 - {"songs": [...]} collections where every item is a normalized entry
 
-New database files use:
-    {"format": "arcaea_wiki_entries", "schema_version": 1, "entries": [...]}
+Individual extracted entries keep their existing normalized shape. Merged database
+collections are written in tracker schema v2:
+    {"format": "arcaea_tracker_database", "schema_version": 2, "entries": [...]}
+
+Semantic chart keys remain PST/PRS/FTR/BYD/ETR/INS. Each chart receives a
+classification object. For ratingClass 3, bydType 0 = Beyond and bydType 1 =
+Inscribed. Exact songlist classification is preserved when already present;
+wiki-only entries use an inferred-semantic classification.
 """
 
 from __future__ import annotations
@@ -39,6 +45,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
+
+FORMAT_V1 = "arcaea_wiki_entries"
+FORMAT_V2 = "arcaea_tracker_database"
+SCHEMA_V2 = 2
+BYD_TYPE_BEYOND = 0
+BYD_TYPE_INSCRIBED = 1
 
 VOLATILE_META_KEYS = {
     "fetched_at",
@@ -68,6 +80,115 @@ def normalized_url(value: Any) -> str:
         return urlunsplit((p.scheme.casefold(), p.netloc.casefold(), p.path, p.query, ""))
     except Exception:
         return raw
+
+
+def normalize_difficulty(value: Any) -> str | None:
+    raw = str(value or "").strip().upper()
+    return {
+        "PST": "PST",
+        "PAST": "PST",
+        "PRS": "PRS",
+        "PRESENT": "PRS",
+        "FTR": "FTR",
+        "FUTURE": "FTR",
+        "BYD": "BYD",
+        "BEYOND": "BYD",
+        "ETR": "ETR",
+        "ETERNAL": "ETR",
+        "INS": "INS",
+        "INSCRIBED": "INS",
+    }.get(raw)
+
+
+def classification_from_difficulty(value: Any) -> dict[str, Any] | None:
+    difficulty = normalize_difficulty(value)
+    if difficulty == "PST":
+        return {"ratingClass": 0, "ratingClassAlias": None, "bydType": None, "source": "inferred-semantic"}
+    if difficulty == "PRS":
+        return {"ratingClass": 1, "ratingClassAlias": None, "bydType": None, "source": "inferred-semantic"}
+    if difficulty == "FTR":
+        return {"ratingClass": 2, "ratingClassAlias": None, "bydType": None, "source": "inferred-semantic"}
+    if difficulty == "BYD":
+        return {"ratingClass": 3, "ratingClassAlias": None, "bydType": BYD_TYPE_BEYOND, "source": "inferred-semantic"}
+    if difficulty == "ETR":
+        return {"ratingClass": 4, "ratingClassAlias": None, "bydType": None, "source": "inferred-semantic"}
+    if difficulty == "INS":
+        return {"ratingClass": 3, "ratingClassAlias": 1, "bydType": BYD_TYPE_INSCRIBED, "source": "inferred-semantic"}
+    return None
+
+
+def ensure_v2_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep copy with schema-v2 chart metadata added, without changing source fields."""
+    output = copy.deepcopy(entry)
+    charts = output.get("charts")
+    if not isinstance(charts, dict):
+        return output
+
+    for diff, chart in charts.items():
+        if not isinstance(chart, dict):
+            continue
+
+        classification = chart.get("classification")
+        if isinstance(classification, dict) and "ratingClass" in classification:
+            # Preserve exact source data. Only fill the normalized discriminator
+            # when an older classification object omitted it.
+            try:
+                rating_class = int(classification.get("ratingClass"))
+            except (TypeError, ValueError):
+                rating_class = None
+            if rating_class == 3 and classification.get("bydType") is None:
+                alias = classification.get("ratingClassAlias")
+                try:
+                    alias = None if alias is None else int(alias)
+                except (TypeError, ValueError):
+                    alias = None
+                classification["bydType"] = BYD_TYPE_INSCRIBED if alias == 1 else BYD_TYPE_BEYOND
+            classification.setdefault("source", "database-v2")
+        else:
+            direct_rating = chart.get("ratingClass")
+            if direct_rating is not None:
+                try:
+                    rating_class = int(direct_rating)
+                except (TypeError, ValueError):
+                    rating_class = None
+                if rating_class is not None:
+                    alias_value = chart.get("ratingClassAlias")
+                    try:
+                        alias = None if alias_value is None else int(alias_value)
+                    except (TypeError, ValueError):
+                        alias = None
+                    byd_type = None
+                    if rating_class == 3:
+                        byd_type = BYD_TYPE_INSCRIBED if alias == 1 else BYD_TYPE_BEYOND
+                    chart["classification"] = {
+                        "ratingClass": rating_class,
+                        "ratingClassAlias": alias,
+                        "bydType": byd_type,
+                        "source": "songlist-direct",
+                    }
+                else:
+                    inferred = classification_from_difficulty(diff)
+                    if inferred is not None:
+                        chart["classification"] = inferred
+            else:
+                inferred = classification_from_difficulty(diff)
+                if inferred is not None:
+                    chart["classification"] = inferred
+
+        existing_visibility = chart.get("visibility")
+        visibility = copy.deepcopy(existing_visibility) if isinstance(existing_visibility, dict) else {}
+        for source_key, target_key in (
+            ("hidden_until_unlocked", "hiddenUntilUnlocked"),
+            ("hiddenUntilUnlocked", "hiddenUntilUnlocked"),
+            ("hidden_until", "hiddenUntil"),
+            ("hiddenUntil", "hiddenUntil"),
+        ):
+            if source_key in chart and target_key not in visibility:
+                visibility[target_key] = chart[source_key]
+        if visibility:
+            chart["visibility"] = visibility
+
+    return output
 
 
 def is_entry(value: Any) -> bool:
@@ -117,18 +238,32 @@ def entry_identity(entry: dict[str, Any]) -> tuple[str, ...]:
     return ("song", source, title, artist)
 
 
+def comparison_charts(value: Any) -> Any:
+    """Strip database-format metadata so a v2 wrapper does not look like a wiki content change."""
+    charts = copy.deepcopy(value)
+    if not isinstance(charts, dict):
+        return charts
+    for chart in charts.values():
+        if not isinstance(chart, dict):
+            continue
+        chart.pop("classification", None)
+        chart.pop("visibility", None)
+    return charts
+
+
 def semantic_entry(entry: dict[str, Any], compare_meta: bool = False) -> Any:
     """Return the data used to decide whether an existing entry is unchanged.
 
-    By default we compare source + song + charts. Fetch timestamps and parser
-    bookkeeping do not make an otherwise identical song entry "changed".
+    By default we compare source + song + substantive chart fields. Schema-v2
+    classification/visibility wrappers are database-format metadata, so they do
+    not by themselves make an otherwise identical extracted wiki entry changed.
     --compare-meta includes stable _meta fields as well, while still ignoring
     inherently volatile fetch/validation fields.
     """
     base: dict[str, Any] = {
         "source": entry.get("source"),
         "song": copy.deepcopy(entry.get("song")),
-        "charts": copy.deepcopy(entry.get("charts")),
+        "charts": comparison_charts(entry.get("charts")),
     }
     if compare_meta:
         meta = copy.deepcopy(entry.get("_meta", {})) if isinstance(entry.get("_meta"), dict) else {}
@@ -207,38 +342,54 @@ def detect_target_shape(value: Any) -> tuple[str, list[dict[str, Any]]]:
     raise ValueError("target JSON is valid but is not a supported wiki-entry collection")
 
 
+def preserve_v2_chart_metadata(previous: dict[str, Any], replacement: dict[str, Any]) -> dict[str, Any]:
+    """Keep exact classification/visibility when a raw wiki update does not carry them."""
+    output = copy.deepcopy(replacement)
+    old_charts = previous.get("charts")
+    new_charts = output.get("charts")
+    if not isinstance(old_charts, dict) or not isinstance(new_charts, dict):
+        return output
+    for diff, new_chart in new_charts.items():
+        old_chart = old_charts.get(diff)
+        if not isinstance(old_chart, dict) or not isinstance(new_chart, dict):
+            continue
+        if "classification" not in new_chart and isinstance(old_chart.get("classification"), dict):
+            new_chart["classification"] = copy.deepcopy(old_chart["classification"])
+        if "visibility" not in new_chart and isinstance(old_chart.get("visibility"), dict):
+            new_chart["visibility"] = copy.deepcopy(old_chart["visibility"])
+    return output
+
+
+def canonical_v2_collection(original: Any, entries: list[dict[str, Any]], source_format: str | None = None) -> dict[str, Any]:
+    if isinstance(original, dict) and not is_entry(original):
+        out = copy.deepcopy(original)
+    else:
+        out = {}
+
+    previous_format = str(out.get("format") or "").strip()
+    previous_source_format = str(out.get("source_format") or "").strip()
+    if source_format is None:
+        source_format = previous_source_format or previous_format or FORMAT_V1
+
+    # A legacy {"songs": [normalized entries]} collection is promoted to the
+    # canonical v2 entries array instead of carrying the same records twice.
+    out.pop("songs", None)
+    out["format"] = FORMAT_V2
+    out["schema_version"] = SCHEMA_V2
+    out["source_format"] = source_format
+    out["updated_at"] = utc_now()
+    out["entries"] = [ensure_v2_entry(entry) for entry in entries]
+    return out
+
+
 def rebuild_target(original: Any, shape: str, entries: list[dict[str, Any]]) -> Any:
-    if shape == "list":
-        return entries
-    if shape == "entries":
-        out = copy.deepcopy(original)
-        out["entries"] = entries
-        out["updated_at"] = utc_now()
-        return out
-    if shape == "songs":
-        out = copy.deepcopy(original)
-        out["songs"] = entries
-        out["updated_at"] = utc_now()
-        return out
-    if shape == "single":
-        # A single-entry file cannot hold two records. Promote it into the
-        # standard collection format rather than discarding the old record.
-        return {
-            "format": "arcaea_wiki_entries",
-            "schema_version": 1,
-            "updated_at": utc_now(),
-            "entries": entries,
-        }
-    raise ValueError(f"unsupported target shape: {shape}")
+    if shape not in {"list", "entries", "songs", "single"}:
+        raise ValueError(f"unsupported target shape: {shape}")
+    return canonical_v2_collection(original, entries)
 
 
 def new_collection(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "format": "arcaea_wiki_entries",
-        "schema_version": 1,
-        "updated_at": utc_now(),
-        "entries": entries,
-    }
+    return canonical_v2_collection({}, entries, source_format=FORMAT_V1)
 
 
 def ask_corrupt(path_label: str, error: Exception, gui: bool) -> str:
@@ -356,7 +507,7 @@ def merge_entries(
         if len(paths) > 8:
             preview += f", +{len(paths) - 8} more"
         print(f"UPDATE   {entry['song']['title']}  [{preview}]")
-        output[previous_index] = copy.deepcopy(entry)
+        output[previous_index] = preserve_v2_chart_metadata(previous, entry)
         stats["updated"] += 1
 
     return output, stats
@@ -413,6 +564,32 @@ def self_test() -> int:
     new["_meta"]["source_url"] = "https://wikiwiki.jp/arcaea/OTHER"
     merged, stats = merge_entries([base], [new], compare_meta=False)
     assert stats["new"] == 1 and len(merged) == 2
+
+    collection = new_collection([base])
+    assert collection["format"] == FORMAT_V2
+    assert collection["schema_version"] == SCHEMA_V2
+    assert collection["source_format"] == FORMAT_V1
+    ftr_class = collection["entries"][0]["charts"]["FTR"]["classification"]
+    assert ftr_class == {
+        "ratingClass": 2,
+        "ratingClassAlias": None,
+        "bydType": None,
+        "source": "inferred-semantic",
+    }
+
+    ins_entry = copy.deepcopy(base)
+    ins_entry["charts"] = {"INS": {"level": "11", "constant": 11.4, "notes": 1663}}
+    ins_class = new_collection([ins_entry])["entries"][0]["charts"]["INS"]["classification"]
+    assert ins_class["ratingClass"] == 3
+    assert ins_class["ratingClassAlias"] == 1
+    assert ins_class["bydType"] == BYD_TYPE_INSCRIBED
+
+    # A raw source entry must compare equal to the same entry after v2 wrapping,
+    # otherwise every rerun would report a fake update caused only by the format.
+    v2_entry = collection["entries"][0]
+    merged, stats = merge_entries([v2_entry], [base], compare_meta=False)
+    assert stats == {"new": 0, "updated": 0, "identical": 1}
+
     print("merge_wiki_entry self-test passed")
     return 0
 
