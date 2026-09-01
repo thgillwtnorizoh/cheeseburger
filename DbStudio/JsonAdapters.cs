@@ -89,6 +89,8 @@ internal static class JsonAdapters
                     AudioOverride = Boolean(c["audio_override"]),
                     JacketOverride = Boolean(c["jacket_override"]),
                 };
+                ReadClassification(c, chart, diff);
+                ReadVisibility(c, chart);
                 AddStringArray(chart.VariantTitleAliases, c["variant_title_aliases"]);
                 if (!string.IsNullOrWhiteSpace(chart.VariantTitle)) chart.VariantTitleAliases.Add(chart.VariantTitle);
                 song.Charts[diff] = chart;
@@ -141,6 +143,12 @@ internal static class JsonAdapters
                     Constant = Number(node["constant"]),
                     Notes = Integer(node["notes"]) ?? Integer(node["note_count"]),
                     ChartDesigner = Str(node, "chartDesigner") ?? Str(node, "designer"),
+                    RatingClass = ratingClass,
+                    RatingClassAlias = alias,
+                    BydType = ratingClass == 3 ? (alias == 1 ? 1 : 0) : null,
+                    ClassificationSource = "songlist",
+                    HiddenUntilUnlocked = NullableBoolean(node["hiddenUntilUnlocked"]) ?? NullableBoolean(node["hidden_until_unlocked"]),
+                    HiddenUntil = Str(node, "hiddenUntil") ?? Str(node, "hidden_until"),
                     VariantTitle = Localized(node["title_localized"]) ?? Str(node, "title"),
                     VariantArtist = Str(node, "artist"),
                     VariantBpm = Scalar(node["bpm"]) ?? Scalar(node["bpm_base"]),
@@ -204,13 +212,18 @@ internal static class JsonAdapters
 
     public static void Export(string path, IEnumerable<DbSong> songs)
     {
+        File.WriteAllText(path, BuildExportDocument(songs).ToJsonString(Pretty));
+    }
+
+    private static JsonObject BuildExportDocument(IEnumerable<DbSong> songs)
+    {
         var entries = new JsonArray();
         foreach (var song in songs)
         {
             var charts = new JsonObject();
             foreach (var (diff, c) in song.Charts)
             {
-                charts[diff] = new JsonObject
+                var chartObject = new JsonObject
                 {
                     ["level"] = c.Level,
                     ["constant"] = c.Constant,
@@ -226,6 +239,19 @@ internal static class JsonAdapters
                     ["audio_override"] = c.AudioOverride,
                     ["jacket_override"] = c.JacketOverride,
                 };
+
+                var classification = BuildClassification(c, diff);
+                if (classification is not null) chartObject["classification"] = classification;
+
+                if (c.HiddenUntilUnlocked is not null || !string.IsNullOrWhiteSpace(c.HiddenUntil))
+                {
+                    chartObject["visibility"] = new JsonObject
+                    {
+                        ["hiddenUntilUnlocked"] = c.HiddenUntilUnlocked,
+                        ["hiddenUntil"] = c.HiddenUntil,
+                    };
+                }
+                charts[diff] = chartObject;
             }
             entries.Add(new JsonObject
             {
@@ -251,15 +277,107 @@ internal static class JsonAdapters
                 },
             });
         }
-        var root = new JsonObject
+        return new JsonObject
         {
-            ["format"] = "arcaea_wiki_entries",
-            ["schema_version"] = 1,
+            ["format"] = "arcaea_tracker_database",
+            ["schema_version"] = 2,
+            ["source_format"] = "cheeseburger_db_studio",
             ["updated_at"] = DateTimeOffset.UtcNow.ToString("O"),
             ["entries"] = entries,
         };
-        File.WriteAllText(path, root.ToJsonString(Pretty));
     }
+
+    private static JsonObject? BuildClassification(ChartInfo chart, string difficulty)
+    {
+        var ratingClass = chart.RatingClass;
+        var ratingClassAlias = chart.RatingClassAlias;
+        var bydType = chart.BydType;
+        var source = chart.ClassificationSource;
+        var inferred = false;
+
+        if (ratingClass is null)
+        {
+            var semantic = ClassificationFromDifficulty(difficulty);
+            if (semantic is null) return null;
+            ratingClass = semantic.Value.RatingClass;
+            ratingClassAlias = semantic.Value.RatingClassAlias;
+            bydType = semantic.Value.BydType;
+            source = "inferred-semantic";
+            inferred = true;
+        }
+
+        if (ratingClass == 3 && bydType is null)
+        {
+            bydType = ratingClassAlias == 1 || (inferred && difficulty.Equals("INS", StringComparison.OrdinalIgnoreCase)) ? 1 : 0;
+        }
+
+        return new JsonObject
+        {
+            ["ratingClass"] = ratingClass,
+            ["ratingClassAlias"] = ratingClassAlias,
+            ["bydType"] = bydType,
+            ["source"] = source ?? "database-v2",
+        };
+    }
+
+    private static void ReadClassification(JsonObject source, ChartInfo chart, string difficulty)
+    {
+        var nested = source["classification"] as JsonObject;
+        var directRatingClass = Integer(source["ratingClass"]);
+        var ratingClass = Integer(nested?["ratingClass"]) ?? directRatingClass;
+        var ratingClassAlias = Integer(nested?["ratingClassAlias"]) ?? Integer(source["ratingClassAlias"]);
+        var bydType = Integer(nested?["bydType"]) ?? Integer(source["bydType"]);
+        var classificationSource = Str(nested, "source");
+
+        if (ratingClass is null)
+        {
+            var inferred = ClassificationFromDifficulty(difficulty);
+            if (inferred is not null)
+            {
+                ratingClass = inferred.Value.RatingClass;
+                ratingClassAlias = inferred.Value.RatingClassAlias;
+                bydType = inferred.Value.BydType;
+                classificationSource = "inferred-semantic";
+            }
+        }
+        else
+        {
+            if (ratingClass == 3 && bydType is null) bydType = ratingClassAlias == 1 ? 1 : 0;
+            classificationSource ??= nested is not null ? "database-v2" : "songlist-direct";
+        }
+
+        chart.RatingClass = ratingClass;
+        chart.RatingClassAlias = ratingClassAlias;
+        chart.BydType = bydType;
+        chart.ClassificationSource = classificationSource;
+    }
+
+    private static void ReadVisibility(JsonObject source, ChartInfo chart)
+    {
+        var nested = source["visibility"] as JsonObject;
+        chart.HiddenUntilUnlocked =
+            NullableBoolean(nested?["hiddenUntilUnlocked"]) ??
+            NullableBoolean(nested?["hidden_until_unlocked"]) ??
+            NullableBoolean(source["hiddenUntilUnlocked"]) ??
+            NullableBoolean(source["hidden_until_unlocked"]);
+        chart.HiddenUntil =
+            Str(nested, "hiddenUntil") ??
+            Str(nested, "hidden_until") ??
+            Str(source, "hiddenUntil") ??
+            Str(source, "hidden_until");
+    }
+
+    private static (int RatingClass, int? RatingClassAlias, int? BydType)? ClassificationFromDifficulty(string difficulty)
+        => difficulty.Trim().ToUpperInvariant() switch
+        {
+            "PST" or "PAST" => (0, null, null),
+            "PRS" or "PRESENT" => (1, null, null),
+            "FTR" or "FUTURE" => (2, null, null),
+            "BYD" or "BEYOND" => (3, null, 0),
+            "ETR" or "ETERNAL" => (4, null, null),
+            "INS" or "INSCRIBED" => (3, 1, 1),
+            _ => null,
+        };
 
     public static void SelfTest()
     {
@@ -288,6 +406,8 @@ internal static class JsonAdapters
         });
         if (mergedHikari.Count != 1 || mergedHikari[0].Id != "hikari" || mergedHikari[0].Title != "Hikari")
             throw new InvalidDataException("Localized merge self-test failed.");
+        if (mergedHikari[0].Charts["FTR"].ClassificationSource != "songlist")
+            throw new InvalidDataException("Official chart classification was overwritten by wiki enrichment.");
 
         var axiumObj = JsonNode.Parse("""
         {
@@ -307,6 +427,38 @@ internal static class JsonAdapters
             throw new InvalidDataException("Beyond variant self-test failed.");
         if (!axium.MatchesTitle("Axium Divergence") || axium.BeyondVariant?.VariantBpm != "170?")
             throw new InvalidDataException("Beyond variant metadata self-test failed.");
+        if (axium.Charts["BYD"].RatingClass != 3 || axium.Charts["BYD"].BydType != 0)
+            throw new InvalidDataException("Beyond classification self-test failed.");
+
+        var inscribedObj = JsonNode.Parse("""
+        {
+          "id":"testinscribed",
+          "title_localized":{"en":"Test Inscribed"},
+          "artist":"test",
+          "difficulties":[
+            {"ratingClass":2,"rating":10},
+            {"ratingClass":3,"ratingClassAlias":1,"rating":11,"hiddenUntilUnlocked":true}
+          ]
+        }
+        """)!.AsObject();
+        var inscribed = ParseSonglistSong(inscribedObj, "songlist");
+        if (!inscribed.Charts.TryGetValue("INS", out var ins) || ins.RatingClass != 3 || ins.RatingClassAlias != 1 || ins.BydType != 1)
+            throw new InvalidDataException("Inscribed classification self-test failed.");
+
+        var exported = BuildExportDocument(new[] { inscribed });
+        if (exported["format"]?.GetValue<string>() != "arcaea_tracker_database" || exported["schema_version"]?.GetValue<int>() != 2)
+            throw new InvalidDataException("Schema-v2 export header self-test failed.");
+        var exportedEntry = exported["entries"]!.AsArray()[0]!.AsObject();
+        var exportedIns = exportedEntry["charts"]!["INS"]!.AsObject();
+        var exportedClass = exportedIns["classification"]!.AsObject();
+        if (exportedClass["ratingClass"]?.GetValue<int>() != 3 || exportedClass["ratingClassAlias"]?.GetValue<int>() != 1 || exportedClass["bydType"]?.GetValue<int>() != 1)
+            throw new InvalidDataException("Schema-v2 Inscribed export self-test failed.");
+        if (exportedIns["visibility"]?["hiddenUntilUnlocked"]?.GetValue<bool>() != true)
+            throw new InvalidDataException("Schema-v2 visibility export self-test failed.");
+
+        var roundTrip = ParseNormalizedEntry(exportedEntry, "v2");
+        if (roundTrip.Charts["INS"].BydType != 1 || roundTrip.Charts["INS"].ClassificationSource != "songlist")
+            throw new InvalidDataException("Schema-v2 classification round-trip self-test failed.");
     }
 
     private static string? Str(JsonObject? o, string name) => o?[name]?.GetValue<string?>();
@@ -372,11 +524,13 @@ internal static class JsonAdapters
         return null;
     }
 
-    private static bool Boolean(JsonNode? n)
+    private static bool Boolean(JsonNode? n) => NullableBoolean(n) ?? false;
+
+    private static bool? NullableBoolean(JsonNode? n)
     {
-        if (n is not JsonValue v) return false;
+        if (n is not JsonValue v) return null;
         if (v.TryGetValue<bool>(out var b)) return b;
         if (v.TryGetValue<string>(out var s) && bool.TryParse(s, out b)) return b;
-        return false;
+        return null;
     }
 }

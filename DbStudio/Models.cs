@@ -11,6 +11,16 @@ internal sealed class ChartInfo
     public int? Notes { get; set; }
     public string? ChartDesigner { get; set; }
 
+    // Schema-v2 keeps the semantic key (BYD/INS/etc.) while preserving the
+    // original songlist classification as evidence. BYD and INS both use
+    // ratingClass 3; bydType 0 means Beyond and bydType 1 means Inscribed.
+    public int? RatingClass { get; set; }
+    public int? RatingClassAlias { get; set; }
+    public int? BydType { get; set; }
+    public string? ClassificationSource { get; set; }
+    public bool? HiddenUntilUnlocked { get; set; }
+    public string? HiddenUntil { get; set; }
+
     // Some modern charts override song-level identity/metadata. In particular,
     // ratingClass 3 + audioOverride=true is a distinct Beyond song variant.
     public string? VariantTitle { get; set; }
@@ -35,6 +45,12 @@ internal sealed class ChartInfo
             Constant = Constant,
             Notes = Notes,
             ChartDesigner = ChartDesigner,
+            RatingClass = RatingClass,
+            RatingClassAlias = RatingClassAlias,
+            BydType = BydType,
+            ClassificationSource = ClassificationSource,
+            HiddenUntilUnlocked = HiddenUntilUnlocked,
+            HiddenUntil = HiddenUntil,
             VariantTitle = VariantTitle,
             VariantArtist = VariantArtist,
             VariantBpm = VariantBpm,
@@ -54,6 +70,25 @@ internal sealed class ChartInfo
         if (incoming.Constant is not null) Constant = incoming.Constant;
         if (incoming.Notes is not null) Notes = incoming.Notes;
         if (!string.IsNullOrWhiteSpace(incoming.ChartDesigner)) ChartDesigner = incoming.ChartDesigner;
+
+        // The official songlist classification must survive later wiki enrichment.
+        // Otherwise loading a wiki file after songlist would throw away the exact
+        // ratingClassAlias that distinguishes INS from ordinary BYD.
+        var incomingIsSonglist = string.Equals(incoming.ClassificationSource, "songlist", StringComparison.OrdinalIgnoreCase);
+        var currentIsSonglist = string.Equals(ClassificationSource, "songlist", StringComparison.OrdinalIgnoreCase);
+        if (incoming.RatingClass is not null && (RatingClass is null || incomingIsSonglist || !currentIsSonglist))
+        {
+            RatingClass = incoming.RatingClass;
+            RatingClassAlias = incoming.RatingClassAlias;
+            BydType = incoming.BydType;
+            ClassificationSource = incoming.ClassificationSource;
+        }
+
+        if (incoming.HiddenUntilUnlocked is not null && (HiddenUntilUnlocked is null || incomingIsSonglist))
+            HiddenUntilUnlocked = incoming.HiddenUntilUnlocked;
+        if (!string.IsNullOrWhiteSpace(incoming.HiddenUntil) && (string.IsNullOrWhiteSpace(HiddenUntil) || incomingIsSonglist))
+            HiddenUntil = incoming.HiddenUntil;
+
         if (!string.IsNullOrWhiteSpace(incoming.VariantTitle)) VariantTitle = incoming.VariantTitle;
         if (!string.IsNullOrWhiteSpace(incoming.VariantArtist)) VariantArtist = incoming.VariantArtist;
         if (!string.IsNullOrWhiteSpace(incoming.VariantBpm)) VariantBpm = incoming.VariantBpm;
