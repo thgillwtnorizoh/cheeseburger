@@ -382,6 +382,15 @@ def canonical_v2_collection(original: Any, entries: list[dict[str, Any]], source
     return out
 
 
+def needs_v2_upgrade(original: Any, shape: str, entries: list[dict[str, Any]]) -> bool:
+    """Return true when an existing merged target still needs only a format/schema rewrite."""
+    if shape != "entries" or not isinstance(original, dict):
+        return True
+    if original.get("format") != FORMAT_V2 or original.get("schema_version") != SCHEMA_V2:
+        return True
+    return any(ensure_v2_entry(entry) != entry for entry in entries)
+
+
 def rebuild_target(original: Any, shape: str, entries: list[dict[str, Any]]) -> Any:
     if shape not in {"list", "entries", "songs", "single"}:
         raise ValueError(f"unsupported target shape: {shape}")
@@ -577,6 +586,14 @@ def self_test() -> int:
         "source": "inferred-semantic",
     }
 
+    legacy_collection = {
+        "format": FORMAT_V1,
+        "schema_version": 1,
+        "entries": [copy.deepcopy(base)],
+    }
+    assert needs_v2_upgrade(legacy_collection, "entries", legacy_collection["entries"])
+    assert not needs_v2_upgrade(collection, "entries", collection["entries"])
+
     ins_entry = copy.deepcopy(base)
     ins_entry["charts"] = {"INS": {"level": "11", "constant": 11.4, "notes": 1663}}
     ins_class = new_collection([ins_entry])["entries"][0]["charts"]["INS"]["classification"]
@@ -709,7 +726,8 @@ def main() -> int:
         print(f"Merge failed: {exc}", file=sys.stderr)
         return 2
 
-    if stats["new"] == 0 and stats["updated"] == 0:
+    format_upgrade = shape != "new" and needs_v2_upgrade(original, shape, existing_entries)
+    if stats["new"] == 0 and stats["updated"] == 0 and not format_upgrade:
         print(f"No changes. Identical entries skipped: {stats['identical']}")
         return 0
 
@@ -722,6 +740,8 @@ def main() -> int:
         f"summary: new={stats['new']} updated={stats['updated']} "
         f"identical={stats['identical']} total={len(merged_entries)}"
     )
+    if format_upgrade and stats["new"] == 0 and stats["updated"] == 0:
+        print("format: upgraded merged database to schema v2")
 
     if args.dry_run:
         print("dry-run: target not written")
