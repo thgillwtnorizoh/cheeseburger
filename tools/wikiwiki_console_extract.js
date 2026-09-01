@@ -9,7 +9,7 @@
   const SOURCE_FORMAT = "wikiwiki_console_extract";
   const FORMAT = "arcaea_tracker_database";
   const SCHEMA_VERSION = 2;
-  const PARSER_VERSION = "0.2.0";
+  const PARSER_VERSION = "0.3.0";
   const DIFF_NAMES = new Map([
     ["past", "PST"], ["pst", "PST"],
     ["present", "PRS"], ["prs", "PRS"],
@@ -71,7 +71,16 @@
     constant: null,
     notes: null,
     chart_designer: null,
+    variant_title: null,
+    variant_title_aliases: [],
     classification: classificationFromDifficulty(difficulty),
+  });
+
+  const cloneStandaloneChart = (chart) => ({
+    ...chart,
+    variant_title: null,
+    variant_title_aliases: [],
+    classification: chart.classification ? { ...chart.classification } : null,
   });
 
   const rowCells = (tr) => Array.from(tr.children)
@@ -79,13 +88,29 @@
 
   const rowTexts = (tr) => rowCells(tr).map((el) => clean(el.innerText));
 
+  const h1 = document.querySelector("h1");
+  const title = clean(h1?.innerText) || decodeURIComponent(location.pathname.split("/").pop() || "");
+  const pageLines = (document.body?.innerText || "").split(/\r?\n/).map(clean).filter(Boolean);
+
   const findChartTable = () => {
     for (const table of document.querySelectorAll("table")) {
       for (const tr of table.querySelectorAll("tr")) {
-        const texts = rowTexts(tr);
+        const cells = rowCells(tr);
+        const texts = cells.map((cell) => clean(cell.innerText));
         if (!texts.length) continue;
         if (!norm(texts[0]).startsWith("difficulty")) continue;
-        const diffs = texts.slice(1).map(diffCode).filter(Boolean);
+
+        // Some WikiWiki tables represent multiple charts with one difficulty
+        // header cell using colspan. Last, for example, has one Beyond header
+        // spanning both Last | Moment and Last | Eternity. Expand that colspan
+        // into one semantic column per rendered value so level/notes stay paired.
+        const diffs = [];
+        for (const cell of cells.slice(1)) {
+          const code = diffCode(cell.innerText);
+          if (!code) continue;
+          const span = Math.max(1, Number(cell.colSpan) || 1);
+          for (let i = 0; i < span; i += 1) diffs.push(code);
+        }
         if (diffs.length) return { table, diffs };
       }
     }
@@ -144,24 +169,26 @@
 
   const parseConstants = () => {
     // WikiWiki can nest later difficulty bullets inside earlier <li> nodes.
-    // Using rendered line order avoids values bleeding between difficulties.
-    const lines = (document.body?.innerText || "")
-      .split(/\r?\n/)
-      .map(clean)
-      .filter(Boolean);
-    const out = {};
+    // Rendered line order avoids values bleeding between difficulties. Keep the
+    // nearest song-section title too, because duplicate difficulty columns need
+    // constants assigned to the correct variant rather than last-write-wins.
+    const out = [];
+    let contextTitle = null;
 
-    for (let i = 0; i < lines.length; i += 1) {
-      if (!lines[i].includes("譜面定数")) continue;
-      const windowAfter = lines.slice(i, i + 3).join(" ");
+    for (let i = 0; i < pageLines.length; i += 1) {
+      const contextMatch = pageLines[i].match(/楽曲[「『]([^」』]+)[」』]/);
+      if (contextMatch) contextTitle = clean(contextMatch[1]);
+
+      if (!pageLines[i].includes("譜面定数")) continue;
+      const windowAfter = pageLines.slice(i, i + 3).join(" ");
       const valueMatch = windowAfter.match(/譜面定数\s*[:：]\s*(未判明|\d{1,2}(?:\.\d+)?)/);
       if (!valueMatch) continue;
 
-      let code = diffCode(lines[i]);
+      let code = diffCode(pageLines[i]);
       if (!code) {
         for (let j = i - 1; j >= Math.max(0, i - 6); j -= 1) {
-          if (lines[j].length > 32) continue;
-          const candidate = diffCode(lines[j]);
+          if (pageLines[j].length > 32) continue;
+          const candidate = diffCode(pageLines[j]);
           if (candidate) {
             code = candidate;
             break;
@@ -169,7 +196,11 @@
         }
       }
       if (!code) continue;
-      out[code] = valueMatch[1] === "未判明" ? null : Number(valueMatch[1]);
+      out.push({
+        difficulty: code,
+        value: valueMatch[1] === "未判明" ? null : Number(valueMatch[1]),
+        contextTitle,
+      });
     }
     return out;
   };
@@ -185,8 +216,53 @@
     return m ? clean(m[1]) : null;
   };
 
+  const variantTitlesFromHeading = (count) => {
+    if (count < 2) return [];
+    const titleKey = norm(title);
+    for (const heading of document.querySelectorAll("h2,h3")) {
+      const text = clean(heading.innerText);
+      if (!text || !norm(text).includes(titleKey)) continue;
+      const match = text.match(/[（(]([^()（）]+)[)）]/);
+      if (!match) continue;
+      const parts = match[1].split(/\s*\/\s*/).map(clean).filter(Boolean);
+      if (parts.length >= count) return parts.slice(0, count);
+    }
+    return [];
+  };
+
   const { table, diffs } = findChartTable();
-  const charts = Object.fromEntries(diffs.map((d) => [d, blankChart(d)]));
+  const columnCharts = diffs.map((difficulty, index) => ({
+    difficulty,
+    index,
+    variantTitle: null,
+    chart: blankChart(difficulty),
+  }));
+  const splitWarnings = [];
+
+  // Identify repeated semantic difficulties before assigning section-specific
+  // constants. For Last this maps its two BYD columns to Moment and Eternity.
+  const columnGroups = new Map();
+  for (const column of columnCharts) {
+    if (!columnGroups.has(column.difficulty)) columnGroups.set(column.difficulty, []);
+    columnGroups.get(column.difficulty).push(column);
+  }
+  for (const [difficulty, columns] of columnGroups) {
+    if (columns.length < 2) continue;
+    const variants = variantTitlesFromHeading(columns.length);
+    columns.forEach((column, i) => {
+      const variantTitle = variants[i] || null;
+      column.variantTitle = variantTitle;
+      if (variantTitle) {
+        column.chart.variant_title = variantTitle;
+        column.chart.variant_title_aliases = [variantTitle];
+      }
+    });
+    if (variants.length < columns.length) {
+      splitWarnings.push(`${difficulty}: ${columns.length} columns found but only ${variants.length} variant title(s) resolved`);
+    } else {
+      splitWarnings.push(`${difficulty}: ${columns.length} columns split by variant title`);
+    }
+  }
 
   let artist = null;
   let pack = null;
@@ -222,14 +298,14 @@
         }
         Object.assign(designers, parseDesignerGroups(raw.join(" ")));
       } else if (label === "level") {
-        diffs.forEach((d, i) => {
-          charts[d].level = parseLevel(texts[i + 1]);
+        columnCharts.forEach((column, i) => {
+          column.chart.level = parseLevel(texts[i + 1]);
         });
       } else if (label === "notes") {
         // Exact match is deliberate. Some pages have Notes (Joy-Con), which
         // must not overwrite the normal mobile chart note counts.
-        diffs.forEach((d, i) => {
-          charts[d].notes = parseIntValue(texts[i + 1]);
+        columnCharts.forEach((column, i) => {
+          column.chart.notes = parseIntValue(texts[i + 1]);
         });
       } else if (label === "length") {
         const m = texts.slice(1).join(" ").match(/\b\d{1,2}:\d{2}\b/);
@@ -259,13 +335,24 @@
     }
   }
 
-  for (const [d, value] of Object.entries(parseConstants())) {
-    charts[d] ||= blankChart(d);
-    charts[d].constant = value;
+  for (const record of parseConstants()) {
+    const candidates = columnCharts.filter((column) => column.difficulty === record.difficulty);
+    if (!candidates.length) continue;
+
+    let target = null;
+    if (candidates.length === 1) {
+      target = candidates[0];
+    } else if (record.contextTitle) {
+      target = candidates.find((column) => column.variantTitle && norm(column.variantTitle) === norm(record.contextTitle)) || null;
+    }
+    if (!target) target = candidates.find((column) => column.chart.constant == null) || candidates[candidates.length - 1];
+    target.chart.constant = record.value;
   }
-  for (const [d, value] of Object.entries(designers)) {
-    charts[d] ||= blankChart(d);
-    charts[d].chart_designer = value;
+
+  for (const [difficulty, value] of Object.entries(designers)) {
+    for (const column of columnCharts.filter((candidate) => candidate.difficulty === difficulty)) {
+      column.chart.chart_designer = value;
+    }
   }
 
   if (!artwork && table) {
@@ -278,12 +365,8 @@
     }
   }
 
-  const h1 = document.querySelector("h1");
-  const title = clean(h1?.innerText) || decodeURIComponent(location.pathname.split("/").pop() || "");
-
   // Some layouts expose these values in rows outside the exact chart table.
   // Use conservative fallbacks only when the main table did not provide them.
-  const pageLines = (document.body?.innerText || "").split(/\r?\n/).map(clean).filter(Boolean);
   const valueAfterLabel = (...labels) => {
     for (let i = 0; i < pageLines.length - 1; i += 1) {
       if (labels.some((label) => norm(pageLines[i]) === norm(label))) return pageLines[i + 1];
@@ -302,66 +385,105 @@
     addedVersion = parseVersion(raw || "");
   }
 
-  const errors = [];
-  const warnings = [];
-  if (!Object.keys(charts).length) errors.push("No difficulty columns found");
-  if (Object.keys(charts).length && !Object.values(charts).some((c) => c.notes != null)) {
-    warnings.push("No note counts found");
-  }
-  if (Object.keys(charts).length && !Object.values(charts).some((c) => c.constant != null)) {
-    warnings.push("No known chart constants found");
-  }
+  // Build one base entry plus one additional entry for every extra duplicate
+  // difficulty column whose variant title can be resolved. This keeps schema v2
+  // unchanged while avoiding a Frankenstein chart assembled from two columns.
+  const baseCharts = {};
+  const secondaryEntries = [];
+  for (const [difficulty, columns] of columnGroups) {
+    if (!columns.length) continue;
+    baseCharts[difficulty] = columns[0].chart;
 
-  for (const [d, chart] of Object.entries(charts)) {
-    if (chart.notes != null && chart.notes <= 0) errors.push(`${d}: non-positive note count ${chart.notes}`);
-    if (chart.constant != null && (chart.constant < 0 || chart.constant > 15)) {
-      errors.push(`${d}: implausible constant ${chart.constant}`);
+    for (let i = 1; i < columns.length; i += 1) {
+      const column = columns[i];
+      if (!column.variantTitle) continue;
+      secondaryEntries.push({
+        title: column.variantTitle,
+        charts: { [difficulty]: cloneStandaloneChart(column.chart) },
+      });
     }
   }
 
-  const missingConstants = Object.entries(charts)
-    .filter(([, c]) => c.level && c.constant == null)
-    .map(([d]) => d);
-  const missingNotes = Object.entries(charts)
-    .filter(([, c]) => c.level && c.notes == null)
-    .map(([d]) => d);
+  const validateCharts = (charts, inheritedWarnings = []) => {
+    const errors = [];
+    const warnings = [...inheritedWarnings];
+    if (!Object.keys(charts).length) errors.push("No difficulty columns found");
+    if (Object.keys(charts).length && !Object.values(charts).some((c) => c.notes != null)) {
+      warnings.push("No note counts found");
+    }
+    if (Object.keys(charts).length && !Object.values(charts).some((c) => c.constant != null)) {
+      warnings.push("No known chart constants found");
+    }
+
+    for (const [difficulty, chart] of Object.entries(charts)) {
+      if (chart.notes != null && chart.notes <= 0) errors.push(`${difficulty}: non-positive note count ${chart.notes}`);
+      if (chart.constant != null && (chart.constant < 0 || chart.constant > 15)) {
+        errors.push(`${difficulty}: implausible constant ${chart.constant}`);
+      }
+    }
+
+    return {
+      errors,
+      warnings,
+      missingConstants: Object.entries(charts)
+        .filter(([, chart]) => chart.level && chart.constant == null)
+        .map(([difficulty]) => difficulty),
+      missingNotes: Object.entries(charts)
+        .filter(([, chart]) => chart.level && chart.notes == null)
+        .map(([difficulty]) => difficulty),
+    };
+  };
 
   const fetchedAt = new Date().toISOString();
-  const entry = {
-    source: SOURCE,
-    song: {
-      title,
-      artist,
-      pack,
-      bpm,
-      length,
-      side,
-      artwork,
-      added_version: addedVersion,
-    },
-    charts,
-    _meta: {
-      source_url: location.href.split("#")[0],
-      fetched_at: fetchedAt,
-      source_updated_at: sourceUpdatedAt(),
-      parser_version: PARSER_VERSION,
-      artwork_credit: artworkCredit,
-      missing_constants: missingConstants,
-      missing_notes: missingNotes,
-      validation: {
-        ok: errors.length === 0,
-        errors,
-        warnings,
+  const pageUrl = location.href.split("#")[0];
+  const buildEntry = (entryTitle, charts, entryArtwork, extraWarnings = []) => {
+    const validation = validateCharts(charts, [...splitWarnings, ...extraWarnings]);
+    return {
+      source: SOURCE,
+      song: {
+        title: entryTitle,
+        artist,
+        pack,
+        bpm,
+        length,
+        side,
+        artwork: entryArtwork,
+        added_version: addedVersion,
       },
-    },
+      charts,
+      _meta: {
+        source_url: pageUrl,
+        fetched_at: fetchedAt,
+        source_updated_at: sourceUpdatedAt(),
+        parser_version: PARSER_VERSION,
+        artwork_credit: artworkCredit,
+        missing_constants: validation.missingConstants,
+        missing_notes: validation.missingNotes,
+        validation: {
+          ok: validation.errors.length === 0,
+          errors: validation.errors,
+          warnings: validation.warnings,
+        },
+      },
+    };
   };
+
+  const entries = [buildEntry(title, baseCharts, artwork)];
+  for (const secondary of secondaryEntries) {
+    entries.push(buildEntry(
+      secondary.title,
+      secondary.charts,
+      null,
+      [`Split from multi-chart WikiWiki page ${title}`],
+    ));
+  }
 
   const result = {
     format: FORMAT,
     schema_version: SCHEMA_VERSION,
     source_format: SOURCE_FORMAT,
     updated_at: fetchedAt,
-    entries: [entry],
+    entries,
   };
 
   const json = JSON.stringify(result, null, 2);
@@ -373,10 +495,10 @@
   try {
     if (typeof copy === "function") {
       copy(json);
-      console.info("[Arcaea DB] Schema-v2 JSON copied to clipboard.");
+      console.info(`[Arcaea DB] Schema-v2 JSON copied to clipboard (${entries.length} entr${entries.length === 1 ? "y" : "ies"}).`);
     } else if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(json)
-        .then(() => console.info("[Arcaea DB] Schema-v2 JSON copied to clipboard."))
+        .then(() => console.info(`[Arcaea DB] Schema-v2 JSON copied to clipboard (${entries.length} entr${entries.length === 1 ? "y" : "ies"}).`))
         .catch(() => console.info("[Arcaea DB] Could not copy automatically; use the printed JSON."));
     }
   } catch (_) {
